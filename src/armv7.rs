@@ -2729,7 +2729,7 @@ impl Decoder<ARMv7> for InstDecoder {
                         0b011 => Opcode::LDRT,
                         0b110 => Opcode::STRBT,
                         0b111 => Opcode::LDRBT,
-                        _ => { unreachable!(); }
+                        _ => { return Err(DecodeError::InvalidOpcode); }
                     };
                     inst.operands = [
                         Operand::Reg(Reg::from_u8(Rt)),
@@ -2795,7 +2795,7 @@ impl Decoder<ARMv7> for InstDecoder {
                                 }
                                 Opcode::LDRB
                             },
-                            _ => { unreachable!(); }
+                            _ => { return Err(DecodeError::InvalidOpcode); }
                         }
                     };
                     inst.operands = [
@@ -2851,7 +2851,7 @@ impl Decoder<ARMv7> for InstDecoder {
                             0b011 => Opcode::LDRT,
                             0b110 => Opcode::STRBT,
                             0b111 => Opcode::LDRBT,
-                            _ => { unreachable!(); }
+                            _ => { return Err(DecodeError::InvalidOpcode); }
                         };
                     } else {
                         /*
@@ -2866,7 +2866,7 @@ impl Decoder<ARMv7> for InstDecoder {
                             0b001 => Opcode::LDR,
                             0b100 => Opcode::STRB,
                             0b101 => Opcode::LDRB,
-                            _ => { unreachable!(); }
+                            _ => { return Err(DecodeError::InvalidOpcode); }
                         };
                     }
                     let (Rt, shift) = {
