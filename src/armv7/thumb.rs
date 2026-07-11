@@ -2,7 +2,8 @@ use yaxpeax_arch::Arch;
 
 use crate::armv7::{
     ARMv7, ConditionCode, DecodeError, CReg, Reg, Reader, RegShift,
-    Operand, Opcode, Instruction, InstDecoder, StatusRegMask
+    Operand, Opcode, Instruction, InstDecoder, StatusRegMask,
+    decode_thumb_coproc,
 };
 
 use bitvec::prelude::*;
@@ -2308,7 +2309,15 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                             }
                         } else {
                             // `Advanced SIMD element or structure load/store instructions`
-                            // (`A7-273`)
+                            // (`A7-273`). the Thumb encoding (`1111 1001 ...`) shares bits[23:0]
+                            // with the A32 form (`1111 0100 ...`); rebuild the A32 top byte and
+                            // reuse the shared decoder.
+                            let thumb = ((instr as u32) << 16) | (lower as u32);
+                            let arm = 0xf400_0000 | (thumb & 0x00ff_ffff);
+                            let (opcode, operands) = crate::armv7::decode_neon_loadstore(arm)?;
+                            inst.opcode = opcode;
+                            inst.operands = operands;
+                            return Ok(());
                         }
                     } else {
                         // this section is a merger of three tables:
@@ -4410,8 +4419,13 @@ fn decode_table_a6_30(decoder: &InstDecoder, inst: &mut Instruction, instr2: Bit
                 }
             }
         } else {
-            // `101x` rows
-            return Err(DecodeError::Incomplete);
+            // `101x` rows - VFP / floating-point. decode via the shared A32 VFP decoder.
+            let hw1 = instr2[0..16].load::<u16>();
+            let hw2 = lower2[0..16].load::<u16>();
+            let (opcode, operands) = decode_thumb_coproc(hw1, hw2)?;
+            inst.opcode = opcode;
+            inst.operands = operands;
+            return Ok(());
         }
     }
     Ok(())

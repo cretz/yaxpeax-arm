@@ -4339,6 +4339,42 @@ fn test_decode_tbb_tbh_cases() {
 }
 
 #[test]
+fn test_thumb_vfp_data_processing() {
+    // three-register f32 data-processing forms (coproc 101x, `1110 1110 ...`).
+    test_display(&[0x00, 0xee, 0x81, 0x0a], "vmla.w.f32 s0, s1, s2");
+    test_display(&[0x20, 0xee, 0x81, 0x0a], "vmul.w.f32 s0, s1, s2");
+    test_display(&[0x30, 0xee, 0x81, 0x0a], "vadd.w.f32 s0, s1, s2");
+    test_display(&[0x30, 0xee, 0xc1, 0x0a], "vsub.w.f32 s0, s1, s2");
+    test_display(&[0x80, 0xee, 0x81, 0x0a], "vdiv.w.f32 s0, s1, s2");
+    // "other" data-processing: register move, compare-with-exception, convert.
+    test_display(&[0xb0, 0xee, 0x41, 0x0a], "vmov.w.f32 s0, s2");
+    test_display(&[0xb4, 0xee, 0xc1, 0x0a], "vcmpe.w.f32 s0, s2");
+    test_display(&[0xbd, 0xee, 0xc0, 0x0a], "vcvt.w.s32.f32 s0, s0");
+}
+
+#[test]
+fn test_thumb_vfp_load_store() {
+    // extension-register load/store (coproc 101x, `1110 110x ...`).
+    test_display(&[0x90, 0xed, 0x00, 0x0a], "vldr.w s0, [r0]");
+    test_display(&[0x80, 0xed, 0x00, 0x0a], "vstr.w s0, [r0]");
+    test_display(&[0x2d, 0xed, 0x01, 0x0a], "vpush.w {s0}");
+    test_display(&[0xbd, 0xec, 0x01, 0x0a], "vpop.w {s0}");
+}
+
+#[test]
+fn test_thumb_vfp_transfer() {
+    // core<->fp register transfers and FP system-register move.
+    test_display(&[0x00, 0xee, 0x10, 0x0a], "vmov.w s0, r0");
+    test_display(&[0xf1, 0xee, 0x10, 0x0a], "vmrs.w r0, fpscr");
+}
+
+#[test]
+fn test_thumb_neon_load_store() {
+    // Advanced SIMD `vld1` (single register, contiguous) - `1111 1001 ...`.
+    test_display(&[0x20, 0xf9, 0x8f, 0x07], "vld1.w.32 {d0}, [r0]");
+}
+
+#[test]
 fn test_decode_tbh_operand_shape() {
     use yaxpeax_arm::armv7::{Opcode, Operand, RegShiftStyle, ShiftStyle};
 

@@ -662,7 +662,7 @@ impl SIMDReg {
 /// `vst1` (single structure to all/one, and multiple) contiguous "multiple" forms; the strided
 /// `vld2`/`vld3`/`vld4` and single-lane/all-lanes forms are deferred (`InvalidOpcode`).
 #[allow(non_snake_case)]
-fn decode_neon_loadstore(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+pub(crate) fn decode_neon_loadstore(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
     let D = ((word >> 22) & 1) as u8;
     let L = (word >> 21) & 1 != 0; // 1 -> load
     let Rn = ((word >> 16) & 0b1111) as u8;
@@ -1153,6 +1153,35 @@ fn decode_vfp_transfer(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError>
     }
 
     Err(DecodeError::InvalidOpcode)
+}
+
+/// decode a Thumb-2 coprocessor / Advanced-SIMD / floating-point 32-bit instruction by mapping it
+/// onto the equivalent A32 encoding and reusing the A32 decoders.
+///
+/// the VFP (coproc `101x`) forms share bits[27:0] with A32 exactly - only the condition differs, and
+/// Thumb takes its condition from the enclosing IT state - so we splice in an `AL` condition (`1110`)
+/// and call `decode_vfp`. the Advanced-SIMD element/structure load/store forms share bits[23:0] with
+/// A32 and differ only in the top byte (Thumb `1111 1001`, A32 `1111 0100`), so we rebuild that byte
+/// and call `decode_neon_loadstore`. `hw1`/`hw2` are the two instruction halfwords in order.
+pub(crate) fn decode_thumb_coproc(hw1: u16, hw2: u16) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let thumb = ((hw1 as u32) << 16) | (hw2 as u32);
+    let coproc = ((thumb >> 8) & 0b1111) as u8;
+
+    // VFP / floating-point (coproc 101x): identical to A32 in bits[27:0]. force cond = AL (0b1110).
+    if coproc & 0b1110 == 0b1010 {
+        let arm = 0xe000_0000 | (thumb & 0x0fff_ffff);
+        return decode_vfp(arm);
+    }
+
+    // Advanced SIMD element/structure load/store: Thumb `1111 1001 ...`, A32 `1111 0100 ...`.
+    // bits[23:0] match; rebuild the A32 top byte (0xf4) and reuse the shared decoder.
+    if (thumb >> 24) == 0b1111_1001 {
+        let arm = 0xf400_0000 | (thumb & 0x00ff_ffff);
+        return decode_neon_loadstore(arm);
+    }
+
+    // generic coprocessor (STC/LDC/MCR/MRC/CDP...) and NEON data-processing are not yet decoded.
+    Err(DecodeError::Incomplete)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
