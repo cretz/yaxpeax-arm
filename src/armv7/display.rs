@@ -456,6 +456,24 @@ fn vfp_suffix(instr: &Instruction) -> Option<&'static str> {
     }
 }
 
+/// write an Advanced-SIMD data-type suffix (`8`, `s16`, `u32`, `i16`, `f32`, `p8`, ...) without
+/// the leading dot.
+fn write_simd_dt<T: DisplaySink>(out: &mut T, dt: crate::armv7::SIMDDataType) -> fmt::Result {
+    use crate::armv7::SIMDDataType;
+    let (prefix, size) = match dt {
+        SIMDDataType::Any(s) => ("", s),
+        SIMDDataType::Signed(s) => ("s", s),
+        SIMDDataType::Unsigned(s) => ("u", s),
+        SIMDDataType::Int(s) => ("i", s),
+        SIMDDataType::Float(s) => ("f", s),
+        SIMDDataType::Poly(s) => ("p", s),
+    };
+    if !prefix.is_empty() {
+        out.write_char(prefix.as_bytes()[0] as char)?;
+    }
+    write_dec_u8(out, size)
+}
+
 /// the `.<ty>` token for a VFP scalar data type, as rendered in a `vcvt` suffix.
 fn vfp_type_name(ty: crate::armv7::VfpType) -> &'static str {
     use crate::armv7::VfpType;
@@ -779,12 +797,26 @@ pub(crate) fn visit_inst<T: DisplaySink>(instr: &Instruction, out: &mut T) -> fm
             instr.operands[1].visit(&mut op_visitor)?;
             return Ok(());
         }
+        Opcode::VDUP(dt) | Opcode::VMOVLane(dt) => {
+            out.span_start_opcode();
+            instr.write_conditioned_opcode(&instr.opcode, out)?;
+            out.write_char('.')?;
+            write_simd_dt(out, dt)?;
+            out.span_end_opcode();
+            out.write_char(' ')?;
+            let mut op_visitor = DisplayingOperandVisitor { f: out };
+            instr.operands[0].visit(&mut op_visitor)?;
+            out.write_fixed_size(", ")?;
+            let mut op_visitor = DisplayingOperandVisitor { f: out };
+            instr.operands[1].visit(&mut op_visitor)?;
+            return Ok(());
+        }
         Opcode::VMLA | Opcode::VMLS | Opcode::VNMLA | Opcode::VNMLS | Opcode::VMUL
         | Opcode::VNMUL | Opcode::VADD | Opcode::VSUB | Opcode::VDIV | Opcode::VFMA
         | Opcode::VFMS | Opcode::VFNMA | Opcode::VFNMS | Opcode::VABS | Opcode::VNEG
         | Opcode::VSQRT | Opcode::VMOV | Opcode::VCMP(_)
         | Opcode::VLDR | Opcode::VSTR | Opcode::VPUSH | Opcode::VPOP | Opcode::VLDM(_)
-        | Opcode::VSTM(_) | Opcode::VLDMX(_) | Opcode::VSTMX(_) | Opcode::VDUP => {
+        | Opcode::VSTM(_) | Opcode::VLDMX(_) | Opcode::VSTMX(_) => {
             out.span_start_opcode();
             instr.write_conditioned_opcode(&instr.opcode, out)?;
             if let Some(suffix) = vfp_suffix(instr) {
@@ -1205,7 +1237,8 @@ impl <T: fmt::Write, Y: YaxColors> Colorize<T, Y> for ConditionedOpcode {
             Opcode::VSTM(_) |
             Opcode::VLDMX(_) |
             Opcode::VSTMX(_) |
-            Opcode::VDUP |
+            Opcode::VDUP(_) |
+            Opcode::VMOVLane(_) |
             Opcode::VCVT { .. } => { write!(out, "{}", colors.arithmetic_op(self)) },
         }
     }
@@ -1498,7 +1531,8 @@ impl Opcode {
             Opcode::VLDMX(false) => { "fldmdbx" },
             Opcode::VSTMX(true) => { "fstmiax" },
             Opcode::VSTMX(false) => { "fstmdbx" },
-            Opcode::VDUP => { "vdup" },
+            Opcode::VDUP(_) => { "vdup" },
+            Opcode::VMOVLane(_) => { "vmov" },
             Opcode::VCVT { round: false, .. } => { "vcvt" },
             Opcode::VCVT { round: true, .. } => { "vcvtr" },
         }

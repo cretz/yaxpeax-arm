@@ -297,7 +297,12 @@ pub enum Opcode {
     VLDMX(bool),
     /// deprecated `fstmiax`/`fstmdbx` (the "X", extra-word, store-multiple form).
     VSTMX(bool),
-    VDUP,
+    /// `vdup` broadcasting an ARM core register across a SIMD register; the datatype gives the
+    /// element size.
+    VDUP(SIMDDataType),
+    /// `vmov` transferring a single lane between an ARM core register and a SIMD register; the
+    /// datatype gives the element size and (for lane-to-core) signedness.
+    VMOVLane(SIMDDataType),
     /// `vcvt`/`vcvtr` between floating-point and integer, and between f32 and f64. the destination
     /// and source data types are carried explicitly; `round` selects `vcvtr` (round per FPSCR)
     /// over `vcvt` (round toward zero) for the float-to-integer forms.
@@ -315,6 +320,25 @@ pub enum VfpType {
     U16,
     S32,
     U32,
+}
+
+/// an Advanced-SIMD/NEON data-type suffix (`.8`, `.s16`, `.u32`, `.i16`, `.f32`, `.p8`, ...). the
+/// `u8` in each variant is the element size in bits.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum SIMDDataType {
+    /// a size with no signedness, e.g. `.8`, `.32`.
+    Any(u8),
+    /// a signed integer, e.g. `.s16`.
+    Signed(u8),
+    /// an unsigned integer, e.g. `.u16`.
+    Unsigned(u8),
+    /// an unspecified integer, e.g. `.i16`.
+    Int(u8),
+    /// a floating-point type, e.g. `.f32`.
+    Float(u8),
+    /// a polynomial type, e.g. `.p8`.
+    Poly(u8),
 }
 
 static DATA_PROCESSING_OPCODES: [Opcode; 16] = [
@@ -948,7 +972,68 @@ fn decode_vfp_transfer(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError>
                 }
             }
         }
-        // scalar VMOV (cp == 1011) and VDUP are not yet decoded.
+        if cp == 0b1011 {
+            // VMOV (core<->scalar) and VDUP (core->SIMD). the element size comes from bit22 and
+            // bit5; the lane index from bit21 and (for smaller sizes) bit6/bit5.
+            let bit22 = (word >> 22) & 1;
+            let bit21 = ((word >> 21) & 1) as u8;
+            let bit6 = ((word >> 6) & 1) as u8;
+            let bit5 = ((word >> 5) & 1) as u8;
+            let bit23 = (word >> 23) & 1;
+            let N = ((word >> 7) & 1) as u8;
+            let Vn = ((word >> 16) & 0b1111) as u8;
+            let dn = SIMDReg::new(SIMDSizeCode::D, (N << 4) | Vn);
+
+            // (size, lane) from the element-size encoding.
+            let (size, lane) = if bit22 == 1 {
+                (8u8, (bit21 << 2) | (bit6 << 1) | bit5)
+            } else if bit5 == 1 {
+                (16u8, (bit21 << 1) | bit6)
+            } else {
+                (32u8, bit21)
+            };
+
+            if !L && bit23 == 1 {
+                // VDUP: broadcast Rt across Dd (Q==0) or Qd (Q==1).
+                if (word >> 6) & 1 != 0 || word & 0xf != 0 {
+                    return Err(DecodeError::InvalidOpcode);
+                }
+                let Q = (word >> 21) & 1 != 0;
+                let vsize = if bit22 == 1 { 8 } else if bit5 == 1 { 16 } else { 32 };
+                // for VDUP the destination is Vd=bits[19:16] with the high bit in bit7 (== N here).
+                let dd_num = (N << 4) | Vn;
+                let dd = if Q {
+                    SIMDReg::new(SIMDSizeCode::Q, dd_num >> 1)
+                } else {
+                    SIMDReg::new(SIMDSizeCode::D, dd_num)
+                };
+                return Ok((Opcode::VDUP(SIMDDataType::Any(vsize)), [
+                    Operand::SIMDReg(dd), Operand::Reg(Reg::from_u8(Rt)),
+                    Operand::Nothing, Operand::Nothing,
+                ]));
+            }
+
+            if L {
+                // VMOV lane -> core. 8/16-bit forms carry a signedness (bit23 == U); 32-bit does not.
+                let dt = if size == 32 {
+                    SIMDDataType::Any(32)
+                } else if bit23 == 1 {
+                    SIMDDataType::Unsigned(size)
+                } else {
+                    SIMDDataType::Signed(size)
+                };
+                return Ok((Opcode::VMOVLane(dt), [
+                    Operand::Reg(Reg::from_u8(Rt)), Operand::SIMDRegLane(dn, lane),
+                    Operand::Nothing, Operand::Nothing,
+                ]));
+            } else {
+                // VMOV core -> lane.
+                return Ok((Opcode::VMOVLane(SIMDDataType::Any(size)), [
+                    Operand::SIMDRegLane(dn, lane), Operand::Reg(Reg::from_u8(Rt)),
+                    Operand::Nothing, Operand::Nothing,
+                ]));
+            }
+        }
         return Err(DecodeError::InvalidOpcode);
     }
 
