@@ -433,8 +433,8 @@ pub(crate) fn visit_inst<T: DisplaySink>(instr: &Instruction, out: &mut T) -> fm
                 _ => {}
             }
         },
-        Opcode::LDM(true, false, false, _usermode) => {
-            // TODO: what indicates usermode in the ARM syntax?
+        // the POP alias does not apply to the user-mode (S-bit) form, which must render `^`.
+        Opcode::LDM(true, false, false, false) => {
             match instr.operands {
                 [Operand::RegWBack(Reg { bits: 13 }, true), Operand::RegList(list), Operand::Nothing, Operand::Nothing] => {
                     out.span_start_opcode();
@@ -452,8 +452,8 @@ pub(crate) fn visit_inst<T: DisplaySink>(instr: &Instruction, out: &mut T) -> fm
                 _ => {}
             }
         }
-        Opcode::STM(false, true, false, _usermode) => {
-            // TODO: what indicates usermode in the ARM syntax?
+        // the PUSH alias does not apply to the user-mode (S-bit) form, which must render `^`.
+        Opcode::STM(false, true, false, false) => {
             match instr.operands {
                 [Operand::RegWBack(Reg { bits: 13 }, true), Operand::RegList(list), Operand::Nothing, Operand::Nothing] => {
                     out.span_start_opcode();
@@ -664,9 +664,8 @@ pub(crate) fn visit_inst<T: DisplaySink>(instr: &Instruction, out: &mut T) -> fm
     }
 
     match instr.opcode {
-        // TODO: [add, pre, usermode]
-        Opcode::STM(_add, _pre, _wback, _usermode) |
-        Opcode::LDM(_add, _pre, _wback, _usermode) => {
+        Opcode::STM(_add, _pre, _wback, usermode) |
+        Opcode::LDM(_add, _pre, _wback, usermode) => {
             match instr.operands {
                 [Operand::RegWBack(Rr, wback), Operand::RegList(list), Operand::Nothing, Operand::Nothing] => {
                     out.write_char(' ')?;
@@ -677,6 +676,8 @@ pub(crate) fn visit_inst<T: DisplaySink>(instr: &Instruction, out: &mut T) -> fm
                         f: out,
                     };
                     op_visitor.visit_reglist(list)?;
+                    // the S bit (user-mode / exception-return registers) renders as a `^` suffix.
+                    if usermode { out.write_fixed_size(" ^")?; }
                     return Ok(());
                 },
                 _ => { unreachable!(); }
@@ -1043,16 +1044,15 @@ impl Opcode {
             Opcode::STREXD => { "strexd" },
             Opcode::LDREX => { "ldrex" },
             Opcode::STREX => { "strex" },
+            // (add, pre) == (U, P): (0,0)=DA, (0,1)=DB, (1,0)=IA, (1,1)=IB.
             Opcode::LDM(false, false, _, _) => { "ldmda" },
             Opcode::LDM(false, true, _, _) => { "ldmdb" },
-            // TODO: seems like these are backwards
             Opcode::LDM(true, false, _, _) => { "ldm" },
-            Opcode::LDM(true, true, _, _) => { "ldmia" },
+            Opcode::LDM(true, true, _, _) => { "ldmib" },
             Opcode::STM(false, false, _, _) => { "stmda" },
             Opcode::STM(false, true, _, _) => { "stmdb" },
-            // TODO: seems like these are backwards
             Opcode::STM(true, false, _, _) => { "stm" },
-            Opcode::STM(true, true, _, _) => { "stmia" },
+            Opcode::STM(true, true, _, _) => { "stmib" },
             Opcode::LDR => { "ldr" },
             Opcode::STR => { "str" },
             Opcode::LDRH => { "ldrh" },

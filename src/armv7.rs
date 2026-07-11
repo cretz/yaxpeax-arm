@@ -453,22 +453,26 @@ impl Reg {
                 Some(Operand::BankedReg(Bank::Fiq, Reg::from_u8(13))),
                 Some(Operand::BankedReg(Bank::Fiq, Reg::from_u8(14))),
                 None,
-                Some(Operand::BankedReg(Bank::Irq, Reg::from_u8(13))),
+                // for the alternate modes (irq/svc/abt/und/mon/hyp) the even SYSm selects R14
+                // (LR) and the odd selects R13 (SP) - the reverse of the usr/fiq block above.
+                // (ARM ARM Table B9-2.) SYSm 0b11110 is ELR_hyp, rendered `lr_hyp` here and
+                // reconciled in the differential harness.
                 Some(Operand::BankedReg(Bank::Irq, Reg::from_u8(14))),
-                Some(Operand::BankedReg(Bank::Svc, Reg::from_u8(13))),
+                Some(Operand::BankedReg(Bank::Irq, Reg::from_u8(13))),
                 Some(Operand::BankedReg(Bank::Svc, Reg::from_u8(14))),
-                Some(Operand::BankedReg(Bank::Abt, Reg::from_u8(13))),
+                Some(Operand::BankedReg(Bank::Svc, Reg::from_u8(13))),
                 Some(Operand::BankedReg(Bank::Abt, Reg::from_u8(14))),
-                Some(Operand::BankedReg(Bank::Und, Reg::from_u8(13))),
+                Some(Operand::BankedReg(Bank::Abt, Reg::from_u8(13))),
                 Some(Operand::BankedReg(Bank::Und, Reg::from_u8(14))),
+                Some(Operand::BankedReg(Bank::Und, Reg::from_u8(13))),
                 None,
                 None,
                 None,
                 None,
-                Some(Operand::BankedReg(Bank::Mon, Reg::from_u8(13))),
                 Some(Operand::BankedReg(Bank::Mon, Reg::from_u8(14))),
-                Some(Operand::BankedReg(Bank::Hyp, Reg::from_u8(13))),
+                Some(Operand::BankedReg(Bank::Mon, Reg::from_u8(13))),
                 Some(Operand::BankedReg(Bank::Hyp, Reg::from_u8(14))),
+                Some(Operand::BankedReg(Bank::Hyp, Reg::from_u8(13))),
             ][M as usize]
         } else {
             if M == 0b01110 {
@@ -1319,7 +1323,8 @@ impl Decoder<ARMv7> for InstDecoder {
                                 inst.opcode = Opcode::SRS(P, U);
                                 inst.operands = [
                                     Operand::RegWBack(Reg::from_u8(13), W),
-                                    Operand::Imm32(word & 0b1111),
+                                    // the mode field is 5 bits.
+                                    Operand::Imm32(word & 0b11111),
                                     Operand::Nothing,
                                     Operand::Nothing,
                                 ];
@@ -1355,10 +1360,12 @@ impl Decoder<ARMv7> for InstDecoder {
                         inst.opcode = Opcode::BLX;
                         let operand = ((word & 0xffffff) as i32) << 8 >> 7;
                         inst.operands = [
+                            // BranchThumbOffset(v) targets addr + (v << 1); the `+ 4` accounts for
+                            // the +8 byte A32 pipeline offset (H bit is the low halfword bit).
                             Operand::BranchThumbOffset(
-                                operand | (
+                                (operand | (
                                     ((word >> 24) & 0b1) as i32
-                                )
+                                )) + 4
                             ),
                             Operand::Nothing,
                             Operand::Nothing,
@@ -1657,6 +1664,15 @@ impl Decoder<ARMv7> for InstDecoder {
                     // |c o n d|0 0 0 1|x x x x x x x x x x x x x x x x|1 0 0 1|x x x x|
                                 // this is swp or {ld,st}ex, conditional on bit 23
                                 // see page A5-203
+                                //
+                                // the exclusive-access encodings (flags 0b11xxx) fix bits[11:8]
+                                // (HiOffset) to 1111. other values here are the ARMv8
+                                // load-acquire/store-release family (LDA/STL/LDAEX/STLEX/...),
+                                // which is not part of ARMv7 - reject rather than mis-decode as
+                                // LDREX/STREX.
+                                if flags >= 0b11000 && HiOffset != 0b1111 {
+                                    return Err(DecodeError::InvalidOpcode);
+                                }
                                 match flags {
                                     0b10000 => {
                                         inst.opcode = Opcode::SWP;
@@ -2142,7 +2158,8 @@ impl Decoder<ARMv7> for InstDecoder {
                                     // test B bit (bit 9)
                                     if word & 0b10_0000_0000 != 0 {
                                         // TODO: ARMv7VE flag
-                                        let SYSm = (((word >> 9) & 1) << 4) as u8 | ((word >> 16) & 0x0f) as u8;
+                                        // SYSm<4> is the M bit (bit8); SYSm<3:0> is M1 (bits19:16).
+                                        let SYSm = (((word >> 8) & 1) << 4) as u8 | ((word >> 16) & 0x0f) as u8;
                                         let R = (word >> 22) & 1;
 
                                         if opcode & 0b01 == 0b01 {
@@ -2414,9 +2431,10 @@ impl Decoder<ARMv7> for InstDecoder {
                             // Halfword multiply and multiply accumulate on page A5-200
                             match (word >> 21) & 0b11 {
                                 0b00 => {
-                                    let Rn_b = ((word >> 6) & 1) == 0;
-                                    let Rm_b = ((word >> 5) & 1) == 0;
-                                    inst.opcode = Opcode::SMLA(Rn_b, Rm_b);
+                                    // N (bit5) selects the Rn halfword, M (bit6) the Rm; true == top.
+                                    let n_top = ((word >> 5) & 1) == 1;
+                                    let m_top = ((word >> 6) & 1) == 1;
+                                    inst.opcode = Opcode::SMLA(n_top, m_top);
                                     inst.operands = [
                                         Operand::Reg(Reg::from_u8((word >> 16) as u8 & 0b1111)),
                                         Operand::Reg(Reg::from_u8(word as u8 & 0b1111)),
@@ -2426,10 +2444,12 @@ impl Decoder<ARMv7> for InstDecoder {
                                     return Ok(());
                                 },
                                 0b01 => {
-                                    if word & 0b10000 == 0 {
+                                    // op (bit5): 0 => SMLAW, 1 => SMULW. M (bit6) selects the Rm
+                                    // halfword; true == top.
+                                    let m_top = ((word >> 6) & 1) == 1;
+                                    if (word >> 5) & 1 == 0 {
                                         // SMLAWB, SMLAWT page A8-631
-                                        let Rm_b = ((word >> 5) & 1) == 0;
-                                        inst.opcode = Opcode::SMLAW(Rm_b);
+                                        inst.opcode = Opcode::SMLAW(m_top);
                                         inst.operands = [
                                             Operand::Reg(Reg::from_u8((word >> 16) as u8 & 0b1111)),
                                             Operand::Reg(Reg::from_u8(word as u8 & 0b1111)),
@@ -2439,8 +2459,7 @@ impl Decoder<ARMv7> for InstDecoder {
                                         return Ok(());
                                     } else {
                                         // SMULWB, SMULWT page A8-649
-                                        let Rm_b = ((word >> 5) & 1) == 0;
-                                        inst.opcode = Opcode::SMLAW(Rm_b);
+                                        inst.opcode = Opcode::SMULW(m_top);
                                         inst.operands = [
                                             Operand::Reg(Reg::from_u8((word >> 16) as u8 & 0b1111)),
                                             Operand::Reg(Reg::from_u8(word as u8 & 0b1111)),
@@ -2451,9 +2470,9 @@ impl Decoder<ARMv7> for InstDecoder {
                                     }
                                 }
                                 0b10 => {
-                                    let Rn_b = ((word >> 6) & 1) == 0;
-                                    let Rm_b = ((word >> 5) & 1) == 0;
-                                    inst.opcode = Opcode::SMLAL_halfword(Rn_b, Rm_b);
+                                    let n_top = ((word >> 5) & 1) == 1;
+                                    let m_top = ((word >> 6) & 1) == 1;
+                                    inst.opcode = Opcode::SMLAL_halfword(n_top, m_top);
                                     inst.operands = [
                                         Operand::Reg(Reg::from_u8((word >> 12) as u8 & 0b1111)),
                                         Operand::Reg(Reg::from_u8((word >> 16) as u8 & 0b1111)),
@@ -2467,9 +2486,9 @@ impl Decoder<ARMv7> for InstDecoder {
                                     return Ok(());
                                 }
                                 0b11 => {
-                                    let Rn_b = ((word >> 6) & 1) == 0;
-                                    let Rm_b = ((word >> 5) & 1) == 0;
-                                    inst.opcode = Opcode::SMUL(Rn_b, Rm_b);
+                                    let n_top = ((word >> 5) & 1) == 1;
+                                    let m_top = ((word >> 6) & 1) == 1;
+                                    inst.opcode = Opcode::SMUL(n_top, m_top);
                                     inst.operands = [
                                         Operand::Reg(Reg::from_u8((word >> 16) as u8 & 0b1111)),
                                         Operand::Reg(Reg::from_u8(word as u8 & 0b1111)),
@@ -2617,7 +2636,8 @@ impl Decoder<ARMv7> for InstDecoder {
                                     }
                                     inst.operands = [
                                         Operand::StatusRegMask(StatusRegMask::from_raw(op1 as u8)?),
-                                        Operand::Imm32(word & 0xfff),
+                                        // MSR (immediate) uses a modified immediate.
+                                        Operand::Imm32((word & 0xff).rotate_right(2 * ((word >> 8) & 0xf))),
                                         Operand::Nothing,
                                         Operand::Nothing,
                                     ];
@@ -2634,7 +2654,9 @@ impl Decoder<ARMv7> for InstDecoder {
                             }
                             inst.operands = [
                                 Operand::StatusRegMask(StatusRegMask::from_raw((word >> 16) as u8 & 0b1111 | 0b10000)?),
-                                Operand::Imm32(word & 0xfff),
+                                // MSR (immediate) uses a modified immediate (imm8 ror 2*rot), not
+                                // the raw 12-bit field.
+                                Operand::Imm32((word & 0xff).rotate_right(2 * ((word >> 8) & 0xf))),
                                 Operand::Nothing,
                                 Operand::Nothing,
                             ];
@@ -2661,7 +2683,8 @@ impl Decoder<ARMv7> for InstDecoder {
                         inst.opcode = Opcode::ADR;
                     }
                     match opcode {
-                        0b1101 => {
+                        // MOV (0b1101) and MVN (0b1111) immediate: no Rn operand.
+                        0b1101 | 0b1111 => {
                             inst.operands = [
                                 Operand::Reg(Reg::from_u8(Rd)),
                                 Operand::Imm32(imm),
@@ -2913,8 +2936,10 @@ impl Decoder<ARMv7> for InstDecoder {
                     // 10xxxx
                     inst.opcode = Opcode::B;
 
-                    // the + 2 is to compensate for an architecturally-defined initial offset
-                    let imm24 = ((((word & 0x00ff_ffff) + 2) << 8) as i32) >> 8;
+                    // sign-extend the 24-bit field first, then add 2 to compensate for the
+                    // architecturally-defined initial offset (adding before sign extension
+                    // overflows the field for the largest positive displacements).
+                    let imm24 = (((word & 0x00ff_ffff) << 8) as i32 >> 8) + 2;
 
                     inst.operands = [
                         Operand::BranchOffset(imm24),
@@ -2925,8 +2950,10 @@ impl Decoder<ARMv7> for InstDecoder {
                 } else {
                     // 11xxxx
 
-                    // the + 2 is to compensate for an architecturally-defined initial offset
-                    let imm24 = ((((word & 0x00ff_ffff) + 2) << 8) as i32) >> 8;
+                    // sign-extend the 24-bit field first, then add 2 to compensate for the
+                    // architecturally-defined initial offset (adding before sign extension
+                    // overflows the field for the largest positive displacements).
+                    let imm24 = (((word & 0x00ff_ffff) << 8) as i32 >> 8) + 2;
 
                     inst.opcode = Opcode::BL;
                     inst.operands = [

@@ -537,7 +537,7 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                                         true, // add
                                         false, // preincrement
                                         w, // wback
-                                        true, // usermode
+                                        false, // not user-mode
                                     );
                                     inst.operands = [
                                         Operand::RegWBack(Reg::from_u8(rn), w),
@@ -579,7 +579,7 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                                             false, // decrement
                                             true, // preincrement
                                             w, // wback
-                                            true, // usermode?
+                                            false, // not user-mode
                                         );
                                         inst.operands = [
                                             Operand::RegWBack(Reg::from_u8(rn), w),
@@ -643,7 +643,7 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                                         if w && (lower & (1 << rn)) != 0 {
                                             decoder.unpredictable()?;
                                         }
-                                        inst.opcode = Opcode::LDM(true, false, w, true);
+                                        inst.opcode = Opcode::LDM(true, false, w, false);
                                         inst.operands = [
                                             Operand::RegWBack(Reg::from_u8(rn), w),
                                             Operand::RegList(lower),
@@ -664,7 +664,7 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                                     if w && (lower & (1 << rn)) != 0 {
                                         decoder.unpredictable()?;
                                     }
-                                    inst.opcode = Opcode::LDM(false, true, w, true);
+                                    inst.opcode = Opcode::LDM(false, true, w, false);
                                     inst.operands = [
                                         Operand::RegWBack(Reg::from_u8(rn), w),
                                         Operand::RegList(lower),
@@ -916,7 +916,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                             // TODO: fix shift
                             // TODO: check opcode
                             inst.s = false;
-                            inst.opcode = if lower & 0b10000 != 0 {
+                            // the `tb` field is bit 5 of the second halfword.
+                            inst.opcode = if lower & 0b100000 != 0 {
                                 Opcode::PKHTB
                             } else {
                                 Opcode::PKHBT
@@ -1343,7 +1344,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                             inst.opcode = Opcode::SSAT;
                             inst.operands = [
                                 Operand::Reg(Reg::from_u8(rd)),
-                                Operand::Imm32((lower & 0b11111) as u32),
+                                // SSAT saturates to sat_imm + 1 bits.
+                                Operand::Imm32((lower & 0b11111) as u32 + 1),
                                 Operand::RegShift(shift),
                                 Operand::Nothing,
                             ];
@@ -1357,7 +1359,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                                 inst.opcode = Opcode::SSAT;
                                 inst.operands = [
                                     Operand::Reg(Reg::from_u8(rd)),
-                                    Operand::Imm32((lower & 0b11111) as u32),
+                                    // SSAT saturates to sat_imm + 1 bits.
+                                    Operand::Imm32((lower & 0b11111) as u32 + 1),
                                     Operand::RegShift(shift),
                                     Operand::Nothing,
                                 ];
@@ -1367,7 +1370,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                                 inst.opcode = Opcode::SSAT16;
                                 inst.operands = [
                                     Operand::Reg(Reg::from_u8(rd)),
-                                    Operand::Imm32((lower & 0b11111) as u32),
+                                    // SSAT16 saturates to sat_imm + 1 bits.
+                                    Operand::Imm32((lower & 0b11111) as u32 + 1),
                                     Operand::Reg(Reg::from_u8(rn)),
                                     Operand::Nothing,
                                 ];
@@ -1391,25 +1395,36 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                                 // `BFI` (`A8-336`)
                                 // v6T2
                                 inst.opcode = Opcode::BFI;
-                                let imm3_2 = ((lower >> 10) & 0b11100) | ((lower >> 6) & 0b11);
+                                let lsb = ((lower >> 10) & 0b11100) | ((lower >> 6) & 0b11);
+                                let msb = lower & 0b11111;
+                                if msb < lsb {
+                                    // width would be <= 0; the field spec is malformed.
+                                    return Err(DecodeError::Unpredictable);
+                                }
                                 inst.operands = [
                                     Operand::Reg(Reg::from_u8(rd)),
                                     Operand::Reg(Reg::from_u8(rn)),
-                                    Operand::Imm12(imm3_2),
-                                    // TODO: this is `msb` but the operand here should be `width`
-                                    Operand::Imm12(lower & 0b11111),
+                                    Operand::Imm12(lsb),
+                                    // the operand is the field width, msb - lsb + 1.
+                                    Operand::Imm12((msb + 1).wrapping_sub(lsb)),
                                 ];
                             } else {
                                 // `BFC` (`A8-334`)
                                 // v6T2
                                 inst.opcode = Opcode::BFC;
-                                let imm3_2 = ((lower >> 10) & 0b11100) | ((lower >> 6) & 0b11);
+                                let lsb = ((lower >> 10) & 0b11100) | ((lower >> 6) & 0b11);
+                                let msb = lower & 0b11111;
+                                if msb < lsb {
+                                    // width would be <= 0; the field spec is malformed.
+                                    return Err(DecodeError::Unpredictable);
+                                }
+                                // BFC has no Rn operand (it is the Rn==1111 form of BFI); the last
+                                // operand is the field width, msb - lsb + 1.
                                 inst.operands = [
                                     Operand::Reg(Reg::from_u8(rd)),
-                                    Operand::Reg(Reg::from_u8(rn)),
-                                    Operand::Imm12(imm3_2),
-                                    // TODO: this is `msb` but the operand here should be `width`
-                                    Operand::Imm32((lower & 0b1111) as u32),
+                                    Operand::Imm12(lsb),
+                                    Operand::Imm12((msb + 1).wrapping_sub(lsb)),
+                                    Operand::Nothing,
                                 ];
                             }
                         }
@@ -1505,7 +1520,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                         inst.condition = ConditionCode::build(((instr >> 6) & 0b1111) as u8);
                         inst.opcode = Opcode::B;
                         inst.operands = [
-                            Operand::BranchThumbOffset(imm),
+                            // +2 (halfwords) for the +4 byte thumb pipeline offset.
+                            Operand::BranchThumbOffset(imm + 2),
                             Operand::Nothing,
                             Operand::Nothing,
                             Operand::Nothing,
@@ -1972,7 +1988,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                         ((s as i32) << 23);
                     let imm = (imm << 8) >> 8;
                     inst.operands = [
-                        Operand::BranchThumbOffset(imm),
+                        // +2 (halfwords) for the +4 byte thumb pipeline offset.
+                        Operand::BranchThumbOffset(imm + 2),
                         Operand::Nothing,
                         Operand::Nothing,
                         Operand::Nothing,
@@ -2859,6 +2876,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                                 let rd = lower2[8..12].load::<u8>();
                                 let rm = lower2[0..4].load::<u8>();
                                 inst.opcode = op;
+                                // op1[0] (bit 20) is the S (set-flags) bit.
+                                inst.s = op1[0..1].load::<u8>() == 1;
                                 inst.operands = [
                                     Operand::Reg(Reg::from_u8(rd)),
                                     Operand::Reg(Reg::from_u8(rn)),
@@ -3857,7 +3876,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                 };
                 inst.operands = [
                     Operand::Reg(Reg::from_u8(rn)),
-                    Operand::BranchThumbOffset(imm as i32 + 1),
+                    // BranchThumbOffset(v) targets addr + (v << 1); +2 for the +4 thumb pipeline.
+                    Operand::BranchThumbOffset(imm as i32 + 2),
                     Operand::Nothing,
                     Operand::Nothing,
                 ];
@@ -3923,7 +3943,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                 };
                 inst.operands = [
                     Operand::Reg(Reg::from_u8(rn)),
-                    Operand::BranchThumbOffset(imm as i32 + 1),
+                    // BranchThumbOffset(v) targets addr + (v << 1); +2 for the +4 thumb pipeline.
+                    Operand::BranchThumbOffset(imm as i32 + 2),
                     Operand::Nothing,
                     Operand::Nothing,
                 ];
@@ -3984,7 +4005,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                 };
                 inst.operands = [
                     Operand::Reg(Reg::from_u8(rn)),
-                    Operand::BranchThumbOffset(imm as i32 + 1),
+                    // BranchThumbOffset(v) targets addr + (v << 1); +2 for the +4 thumb pipeline.
+                    Operand::BranchThumbOffset(imm as i32 + 2),
                     Operand::Nothing,
                     Operand::Nothing,
                 ];
@@ -4041,7 +4063,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                 };
                 inst.operands = [
                     Operand::Reg(Reg::from_u8(rn)),
-                    Operand::BranchThumbOffset(imm as i32 + 1),
+                    // BranchThumbOffset(v) targets addr + (v << 1); +2 for the +4 thumb pipeline.
+                    Operand::BranchThumbOffset(imm as i32 + 2),
                     Operand::Nothing,
                     Operand::Nothing,
                 ];
@@ -4163,7 +4186,7 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
             // `STM (STMIA, STMEA)` on page `A8-665` -- v4T
             let rn = instr2[8..11].load::<u8>();
             let reglist = instr2[0..8].load::<u16>();
-            inst.opcode = Opcode::STM(true, true, false, true); // stmia, no wback, yes usermode
+            inst.opcode = Opcode::STM(true, false, false, false); // stmia (increment-after), not user-mode
             inst.operands = [
                 Operand::RegWBack(Reg::from_u8(rn), true), // always wback
                 Operand::RegList(reglist as u16),
@@ -4175,7 +4198,7 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
             let rn = instr2[8..11].load::<u8>();
             let reglist = instr2[0..8].load::<u16>();
             let w = (reglist & (1 << rn)) == 0;
-            inst.opcode = Opcode::LDM(true, false, false, true); // ldmia, no wback, yes usermode
+            inst.opcode = Opcode::LDM(true, false, false, false); // ldmia (increment-after), not user-mode
             inst.operands = [
                 Operand::RegWBack(Reg::from_u8(rn), w),
                 Operand::RegList(reglist as u16),
@@ -4192,7 +4215,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                 let imm = instr2[0..8].load::<u8>() as i8 as i32;
                 inst.condition = ConditionCode::build(opcode);
                 inst.operands = [
-                    Operand::BranchThumbOffset(imm + 1),
+                    // BranchThumbOffset(v) targets addr + (v << 1); +2 for the +4 thumb pipeline.
+                    Operand::BranchThumbOffset(imm + 2),
                     Operand::Nothing,
                     Operand::Nothing,
                     Operand::Nothing,
@@ -4227,7 +4251,8 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
             let imm = instr2[0..11].load::<u32>();
             let imm = ((imm as i32) << 21) >> 21;
             inst.operands = [
-                Operand::BranchThumbOffset(imm),
+                // BranchThumbOffset(v) targets addr + (v << 1); +2 for the +4 thumb pipeline.
+                Operand::BranchThumbOffset(imm + 2),
                 Operand::Nothing,
                 Operand::Nothing,
                 Operand::Nothing,
