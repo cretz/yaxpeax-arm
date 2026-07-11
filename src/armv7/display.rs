@@ -408,6 +408,23 @@ impl<T: DisplaySink> crate::armv7::OperandVisitor for DisplayingOperandVisitor<'
         Ok(())
     }
 
+    fn visit_simd_deref(&mut self, base: Reg, align: u16, wback: bool, post: Option<Reg>) -> Result<Self::Ok, Self::Error> {
+        self.f.write_char('[')?;
+        self.f.write_reg(base.number())?;
+        if align != 0 {
+            self.f.write_char(':')?;
+            write_dec_u32(self.f, align as u32)?;
+        }
+        self.f.write_char(']')?;
+        if wback {
+            self.f.write_char('!')?;
+        } else if let Some(rm) = post {
+            self.f.write_fixed_size(", ")?;
+            self.f.write_reg(rm.number())?;
+        }
+        Ok(())
+    }
+
     fn visit_imm(&mut self, imm: u32) -> Result<Self::Ok, Self::Error> {
         write_dec_u32(self.f, imm)
     }
@@ -797,7 +814,8 @@ pub(crate) fn visit_inst<T: DisplaySink>(instr: &Instruction, out: &mut T) -> fm
             instr.operands[1].visit(&mut op_visitor)?;
             return Ok(());
         }
-        Opcode::VDUP(dt) | Opcode::VMOVLane(dt) => {
+        Opcode::VDUP(dt) | Opcode::VMOVLane(dt)
+        | Opcode::VLDN(_, dt) | Opcode::VSTN(_, dt) => {
             out.span_start_opcode();
             instr.write_conditioned_opcode(&instr.opcode, out)?;
             out.write_char('.')?;
@@ -1239,6 +1257,8 @@ impl <T: fmt::Write, Y: YaxColors> Colorize<T, Y> for ConditionedOpcode {
             Opcode::VSTMX(_) |
             Opcode::VDUP(_) |
             Opcode::VMOVLane(_) |
+            Opcode::VLDN(_, _) |
+            Opcode::VSTN(_, _) |
             Opcode::VCVT { .. } => { write!(out, "{}", colors.arithmetic_op(self)) },
         }
     }
@@ -1535,6 +1555,14 @@ impl Opcode {
             Opcode::VMOVLane(_) => { "vmov" },
             Opcode::VCVT { round: false, .. } => { "vcvt" },
             Opcode::VCVT { round: true, .. } => { "vcvtr" },
+            Opcode::VLDN(1, _) => { "vld1" },
+            Opcode::VLDN(2, _) => { "vld2" },
+            Opcode::VLDN(3, _) => { "vld3" },
+            Opcode::VLDN(_, _) => { "vld4" },
+            Opcode::VSTN(1, _) => { "vst1" },
+            Opcode::VSTN(2, _) => { "vst2" },
+            Opcode::VSTN(3, _) => { "vst3" },
+            Opcode::VSTN(_, _) => { "vst4" },
         }
     }
 }
@@ -1699,6 +1727,9 @@ impl super::Operand {
             },
             Operand::SIMDRegList(first, count) => {
                 visitor.visit_simd_reg_list(first, count)
+            },
+            Operand::SIMDDeref { base, align, wback, post } => {
+                visitor.visit_simd_deref(base, align, wback, post)
             },
             Operand::Imm(imm) => {
                 visitor.visit_imm(imm)

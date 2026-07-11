@@ -307,6 +307,11 @@ pub enum Opcode {
     /// and source data types are carried explicitly; `round` selects `vcvtr` (round per FPSCR)
     /// over `vcvt` (round toward zero) for the float-to-integer forms.
     VCVT { to: VfpType, from: VfpType, round: bool },
+
+    /// NEON structure load `vld1`-`vld4`; the `u8` is the structure count (1-4).
+    VLDN(u8, SIMDDataType),
+    /// NEON structure store `vst1`-`vst4`; the `u8` is the structure count (1-4).
+    VSTN(u8, SIMDDataType),
 }
 
 /// a VFP scalar data type, used to render the `.<ty>` suffixes of `vcvt`.
@@ -651,6 +656,75 @@ impl SIMDReg {
     fn new(size: SIMDSizeCode, num: u8) -> SIMDReg {
         SIMDReg { size, num }
     }
+}
+
+/// decode the NEON structure load/store space (`1111 0100 ...`). currently handles the `vld1`/
+/// `vst1` (single structure to all/one, and multiple) contiguous "multiple" forms; the strided
+/// `vld2`/`vld3`/`vld4` and single-lane/all-lanes forms are deferred (`InvalidOpcode`).
+#[allow(non_snake_case)]
+fn decode_neon_loadstore(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let D = ((word >> 22) & 1) as u8;
+    let L = (word >> 21) & 1 != 0; // 1 -> load
+    let Rn = ((word >> 16) & 0b1111) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Rm = (word & 0b1111) as u8;
+
+    let single = (word >> 23) & 1 != 0;
+    if single {
+        // single-element (to-one-lane / to-all-lanes) forms are not yet decoded.
+        return Err(DecodeError::InvalidOpcode);
+    }
+    // the "multiple" forms require bit20 == 0; other values here are memory hints (pld/pli/...).
+    if (word >> 20) & 1 != 0 {
+        return Err(DecodeError::Incomplete);
+    }
+
+    // "multiple" forms: type field (bits 11:8) selects the structure kind and register count.
+    let ty = (word >> 8) & 0b1111;
+    let size = match (word >> 6) & 0b11 {
+        0 => 8u8,
+        1 => 16,
+        2 => 32,
+        _ => 64,
+    };
+    // only the contiguous vld1/vst1 forms (1-4 registers) are handled here.
+    let count = match ty {
+        0b0111 => 1u8,
+        0b1010 => 2,
+        0b0110 => 3,
+        0b0010 => 4,
+        _ => return Err(DecodeError::InvalidOpcode),
+    };
+
+    let first_num = (D << 4) | Vd;
+    // a list running past d31 is unpredictable; reject it (capstone renders a bogus register name).
+    if first_num as u16 + count as u16 > 32 {
+        return Err(DecodeError::InvalidOperand);
+    }
+    let first = SIMDReg::new(SIMDSizeCode::D, first_num);
+    let list = Operand::SIMDRegList(first, count);
+
+    // alignment: aa (bits 5:4). 00 -> unaligned, else 64 << (aa-1).
+    let align = match (word >> 4) & 0b11 {
+        0 => 0u16,
+        1 => 64,
+        2 => 128,
+        _ => 256,
+    };
+
+    // addressing mode from Rm: 15 -> plain, 13 -> writeback (`!`), else post-indexed by Rm.
+    let deref = if Rm == 0b1111 {
+        Operand::SIMDDeref { base: Reg::from_u8(Rn), align, wback: false, post: None }
+    } else if Rm == 0b1101 {
+        Operand::SIMDDeref { base: Reg::from_u8(Rn), align, wback: true, post: None }
+    } else {
+        Operand::SIMDDeref { base: Reg::from_u8(Rn), align, wback: false, post: Some(Reg::from_u8(Rm)) }
+    };
+
+    let dt = SIMDDataType::Any(size);
+    let opcode = if L { Opcode::VLDN(1, dt) } else { Opcode::VSTN(1, dt) };
+    let _ = count;
+    Ok((opcode, [list, deref, Operand::Nothing, Operand::Nothing]))
 }
 
 /// build a VFP register from the `Vx`/`x` field split used throughout the VFP encodings. for a
@@ -1244,6 +1318,17 @@ pub enum Operand {
     /// extension-register load/store instructions (`vldm`/`vstm`/`vpush`/`vpop`). fields are the
     /// first register and the count of registers in the list.
     SIMDRegList(SIMDReg, u8),
+    /// a NEON structure-load/store memory operand: `[rn]`, `[rn:align]`, `[rn]!`, or `[rn], rm`.
+    SIMDDeref {
+        /// the base register holding the address.
+        base: Reg,
+        /// the alignment in bits (0 = unaligned).
+        align: u16,
+        /// the `!` writeback form (encoded by Rm == SP).
+        wback: bool,
+        /// the post-indexed register form (any other Rm), added to the base after the access.
+        post: Option<Reg>,
+    },
     /// a bare immediate with no `#`-vs-value reinterpretation, printed as written. used for the
     /// VFP `vmov` immediate encodings and fbits counts.
     Imm(u32),
@@ -1324,6 +1409,8 @@ pub trait OperandVisitor {
     fn visit_simd_reg_lane(&mut self, reg: SIMDReg, lane: u8) -> Result<Self::Ok, Self::Error>;
     /// process an operand that is a contiguous list of VFP/Advanced-SIMD registers.
     fn visit_simd_reg_list(&mut self, first: SIMDReg, count: u8) -> Result<Self::Ok, Self::Error>;
+    /// process an operand that is a NEON structure-load/store memory reference.
+    fn visit_simd_deref(&mut self, base: Reg, align: u16, wback: bool, post: Option<Reg>) -> Result<Self::Ok, Self::Error>;
     /// process an operand that is a bare immediate printed as written.
     fn visit_imm(&mut self, imm: u32) -> Result<Self::Ok, Self::Error>;
     /// process an operand that is not defined above. there are no parameters as for an unknown
@@ -2075,6 +2162,13 @@ impl Decoder<ARMv7> for InstDecoder {
             } else {
                 // op1=0xxxxxxx, "Memory hints, Advanced SIMD instructions, and miscellaneous
                 // instructions on pge A5-215"
+                if (word >> 24) & 0b1111 == 0b0100 {
+                    // NEON structure load/store (1111 0100 ...).
+                    let (opcode, operands) = decode_neon_loadstore(word)?;
+                    inst.opcode = opcode;
+                    inst.operands = operands;
+                    return Ok(());
+                }
                 return Err(DecodeError::Incomplete);
             }
             return Ok(());
