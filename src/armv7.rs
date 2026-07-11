@@ -826,10 +826,96 @@ fn decode_vfp_other(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
     }
 }
 
-/// the VFP register-transfer forms (bit4 == 1 in the `cccc 1110 ...` space): VMSR, VMRS, VMOV
-/// (core to scalar / scalar to core), and VDUP. narrowed further by opcode fields.
+/// the VFP register-transfer forms: VMSR, VMRS, VMOV (core<->single, and the 64-bit core-pair
+/// forms). the `cccc 1110 ...` scalar/VDUP forms are not yet handled (`InvalidOpcode`).
 #[allow(non_snake_case)]
-fn decode_vfp_transfer(_word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+fn decode_vfp_transfer(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let top = (word >> 24) & 0b1111;
+    let L = (word >> 20) & 1 != 0;
+    let Rt = ((word >> 12) & 0b1111) as u8;
+
+    if top == 0b1110 {
+        let cp = (word >> 8) & 0b1111; // 1010 single/sysreg, 1011 scalar/dup
+        let sel23 = (word >> 21) & 0b111;
+        if cp == 0b1010 {
+            if sel23 == 0b111 {
+                // VMSR (L==0) / VMRS (L==1). bits 19:16 select the FP system register.
+                let reg = ((word >> 16) & 0b1111) as u8;
+                if L {
+                    return Ok((Opcode::VMRS, [
+                        Operand::Reg(Reg::from_u8(Rt)), Operand::Imm(reg as u32),
+                        Operand::Nothing, Operand::Nothing,
+                    ]));
+                } else {
+                    return Ok((Opcode::VMSR, [
+                        Operand::Imm(reg as u32), Operand::Reg(Reg::from_u8(Rt)),
+                        Operand::Nothing, Operand::Nothing,
+                    ]));
+                }
+            }
+            if sel23 == 0b000 {
+                // VMOV single <-> core register.
+                let N = ((word >> 7) & 1) as u8;
+                let Vn = ((word >> 16) & 0b1111) as u8;
+                let sn = vfp_reg(false, Vn, N);
+                if L {
+                    return Ok((Opcode::VMOV, [
+                        Operand::Reg(Reg::from_u8(Rt)), Operand::SIMDReg(sn),
+                        Operand::Nothing, Operand::Nothing,
+                    ]));
+                } else {
+                    return Ok((Opcode::VMOV, [
+                        Operand::SIMDReg(sn), Operand::Reg(Reg::from_u8(Rt)),
+                        Operand::Nothing, Operand::Nothing,
+                    ]));
+                }
+            }
+        }
+        // scalar VMOV (cp == 1011) and VDUP are not yet decoded.
+        return Err(DecodeError::InvalidOpcode);
+    }
+
+    if top == 0b1100 {
+        // 64-bit VMOV: `cccc 1100 010o uuuu tttt 101s 00m1 mmmm`. reject anything not matching that
+        // fixed field layout (e.g. the ARMv8-M vlldm/vlstm encodings share the top bits).
+        if (word >> 21) & 0b111 != 0b010 || (word >> 6) & 0b11 != 0 || (word >> 4) & 1 == 0 {
+            return Err(DecodeError::InvalidOpcode);
+        }
+        // two core registers <-> a doubleword register or two consecutive singles.
+        let sz = (word >> 8) & 1 != 0; // 0 -> two singles, 1 -> one double
+        let M = ((word >> 5) & 1) as u8;
+        let Vm = (word & 0b1111) as u8;
+        let Rt2 = ((word >> 16) & 0b1111) as u8;
+        if sz {
+            let dm = vfp_reg(true, Vm, M);
+            if L {
+                return Ok((Opcode::VMOV, [
+                    Operand::Reg(Reg::from_u8(Rt)), Operand::Reg(Reg::from_u8(Rt2)),
+                    Operand::SIMDReg(dm), Operand::Nothing,
+                ]));
+            } else {
+                return Ok((Opcode::VMOV, [
+                    Operand::SIMDReg(dm), Operand::Reg(Reg::from_u8(Rt)),
+                    Operand::Reg(Reg::from_u8(Rt2)), Operand::Nothing,
+                ]));
+            }
+        } else {
+            let sm = vfp_reg(false, Vm, M);
+            let sm1 = SIMDReg::new(SIMDSizeCode::S, sm.num.wrapping_add(1));
+            if L {
+                return Ok((Opcode::VMOV, [
+                    Operand::Reg(Reg::from_u8(Rt)), Operand::Reg(Reg::from_u8(Rt2)),
+                    Operand::SIMDReg(sm), Operand::SIMDReg(sm1),
+                ]));
+            } else {
+                return Ok((Opcode::VMOV, [
+                    Operand::SIMDReg(sm), Operand::SIMDReg(sm1),
+                    Operand::Reg(Reg::from_u8(Rt)), Operand::Reg(Reg::from_u8(Rt2)),
+                ]));
+            }
+        }
+    }
+
     Err(DecodeError::InvalidOpcode)
 }
 

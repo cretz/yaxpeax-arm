@@ -422,10 +422,26 @@ impl<T: DisplaySink> crate::armv7::OperandVisitor for DisplayingOperandVisitor<'
 fn vfp_suffix(instr: &Instruction) -> Option<&'static str> {
     use crate::armv7::SIMDSizeCode;
     match instr.opcode {
+        Opcode::VMOV => {
+            // only the register-move and immediate forms carry an `.f32`/`.f64` suffix; the
+            // core<->register transfer forms (which include a plain GPR operand) do not.
+            if instr.operands.iter().any(|op| matches!(op, Operand::Reg(_))) {
+                return None;
+            }
+            for op in instr.operands.iter() {
+                if let Operand::SIMDReg(r) = op {
+                    return Some(match r.size {
+                        SIMDSizeCode::S => ".f32",
+                        _ => ".f64",
+                    });
+                }
+            }
+            None
+        }
         Opcode::VMLA | Opcode::VMLS | Opcode::VNMLA | Opcode::VNMLS | Opcode::VMUL
         | Opcode::VNMUL | Opcode::VADD | Opcode::VSUB | Opcode::VDIV | Opcode::VFMA
         | Opcode::VFMS | Opcode::VFNMA | Opcode::VFNMS | Opcode::VABS | Opcode::VNEG
-        | Opcode::VSQRT | Opcode::VMOV | Opcode::VCMP(_) => {
+        | Opcode::VSQRT | Opcode::VCMP(_) => {
             for op in instr.operands.iter() {
                 if let Operand::SIMDReg(r) = op {
                     return Some(match r.size {
@@ -437,6 +453,22 @@ fn vfp_suffix(instr: &Instruction) -> Option<&'static str> {
             None
         }
         _ => None,
+    }
+}
+
+/// the name of a VFP system register selected by the 4-bit reg field of VMRS/VMSR.
+fn vfp_sysreg_name(reg: u8) -> &'static str {
+    match reg {
+        0b0000 => "fpsid",
+        0b0001 => "fpscr",
+        0b0101 => "mvfr2",
+        0b0110 => "mvfr1",
+        0b0111 => "mvfr0",
+        0b1000 => "fpexc",
+        0b1001 => "fpinst",
+        0b1010 => "fpinst2",
+        // reserved encodings; capstone rejects these, so the name is never compared.
+        _ => "fpsid",
     }
 }
 
@@ -683,10 +715,42 @@ pub(crate) fn visit_inst<T: DisplaySink>(instr: &Instruction, out: &mut T) -> fm
 
             return Ok(());
         }
+        Opcode::VMRS => {
+            // operands: [Reg(Rt), Imm(sysreg)]. Rt == 15 renders as `apsr_nzcv`.
+            let (Operand::Reg(rt), Operand::Imm(sysreg)) = (&instr.operands[0], &instr.operands[1]) else {
+                unreachable!("vmrs operands");
+            };
+            out.span_start_opcode();
+            instr.write_conditioned_opcode(&instr.opcode, out)?;
+            out.span_end_opcode();
+            out.write_char(' ')?;
+            if rt.number() == 15 {
+                out.write_fixed_size("apsr_nzcv")?;
+            } else {
+                out.write_reg(rt.number())?;
+            }
+            out.write_fixed_size(", ")?;
+            out.write_fixed_size(vfp_sysreg_name(*sysreg as u8))?;
+            return Ok(());
+        }
+        Opcode::VMSR => {
+            // operands: [Imm(sysreg), Reg(Rt)].
+            let (Operand::Imm(sysreg), Operand::Reg(rt)) = (&instr.operands[0], &instr.operands[1]) else {
+                unreachable!("vmsr operands");
+            };
+            out.span_start_opcode();
+            instr.write_conditioned_opcode(&instr.opcode, out)?;
+            out.span_end_opcode();
+            out.write_char(' ')?;
+            out.write_fixed_size(vfp_sysreg_name(*sysreg as u8))?;
+            out.write_fixed_size(", ")?;
+            out.write_reg(rt.number())?;
+            return Ok(());
+        }
         Opcode::VMLA | Opcode::VMLS | Opcode::VNMLA | Opcode::VNMLS | Opcode::VMUL
         | Opcode::VNMUL | Opcode::VADD | Opcode::VSUB | Opcode::VDIV | Opcode::VFMA
         | Opcode::VFMS | Opcode::VFNMA | Opcode::VFNMS | Opcode::VABS | Opcode::VNEG
-        | Opcode::VSQRT | Opcode::VMOV | Opcode::VCMP(_) | Opcode::VMRS | Opcode::VMSR
+        | Opcode::VSQRT | Opcode::VMOV | Opcode::VCMP(_)
         | Opcode::VLDR | Opcode::VSTR | Opcode::VPUSH | Opcode::VPOP | Opcode::VLDM(_)
         | Opcode::VSTM(_) | Opcode::VLDMX(_) | Opcode::VSTMX(_) | Opcode::VDUP | Opcode::VCVT => {
             out.span_start_opcode();
