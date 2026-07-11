@@ -298,9 +298,23 @@ pub enum Opcode {
     /// deprecated `fstmiax`/`fstmdbx` (the "X", extra-word, store-multiple form).
     VSTMX(bool),
     VDUP,
-    /// `vcvt`/`vcvtr` between floating-point and integer/fixed, and between f32 and f64. the
-    /// full data-type suffix is derived from the operands and the stored round-to-zero flag.
-    VCVT,
+    /// `vcvt`/`vcvtr` between floating-point and integer, and between f32 and f64. the destination
+    /// and source data types are carried explicitly; `round` selects `vcvtr` (round per FPSCR)
+    /// over `vcvt` (round toward zero) for the float-to-integer forms.
+    VCVT { to: VfpType, from: VfpType, round: bool },
+}
+
+/// a VFP scalar data type, used to render the `.<ty>` suffixes of `vcvt`.
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum VfpType {
+    F16,
+    F32,
+    F64,
+    S16,
+    U16,
+    S32,
+    U32,
 }
 
 static DATA_PROCESSING_OPCODES: [Opcode; 16] = [
@@ -834,10 +848,59 @@ fn decode_vfp_other(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
 }
 
 /// the VFP conversion sub-group of the "other" data-processing ops (VCVT between float and
-/// integer/fixed, and between f32 and f64). not yet implemented (`InvalidOpcode`).
+/// integer, and between f32 and f64). fixed-point and half-precision forms are deferred.
 #[allow(non_snake_case)]
-fn decode_vfp_cvt(_word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
-    Err(DecodeError::InvalidOpcode)
+fn decode_vfp_cvt(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let sz = (word >> 8) & 1 != 0; // operation size: 0 -> f32, 1 -> f64
+    let D = ((word >> 22) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    let opc2 = ((word >> 16) & 0b1111) as u8;
+    let bit7 = (word >> 7) & 1 != 0;
+
+    let fp_ty = if sz { VfpType::F64 } else { VfpType::F32 };
+
+    match opc2 {
+        0b0111 => {
+            // VCVT between f32 and f64 (only valid with bit7 == 1). the destination has the other
+            // width from the operation size.
+            if !bit7 {
+                return Err(DecodeError::InvalidOpcode);
+            }
+            let (to, from, dd, dm) = if sz {
+                // f64 -> f32
+                (VfpType::F32, VfpType::F64, vfp_reg(false, Vd, D), vfp_reg(true, Vm, M))
+            } else {
+                // f32 -> f64
+                (VfpType::F64, VfpType::F32, vfp_reg(true, Vd, D), vfp_reg(false, Vm, M))
+            };
+            Ok((Opcode::VCVT { to, from, round: false }, [
+                Operand::SIMDReg(dd), Operand::SIMDReg(dm), Operand::Nothing, Operand::Nothing,
+            ]))
+        }
+        0b1000 => {
+            // VCVT integer -> floating-point. source is a 32-bit integer in a single register.
+            let from = if bit7 { VfpType::S32 } else { VfpType::U32 };
+            let dd = vfp_reg(sz, Vd, D);
+            let dm = vfp_reg(false, Vm, M);
+            Ok((Opcode::VCVT { to: fp_ty, from, round: false }, [
+                Operand::SIMDReg(dd), Operand::SIMDReg(dm), Operand::Nothing, Operand::Nothing,
+            ]))
+        }
+        0b1100 | 0b1101 => {
+            // VCVT floating-point -> integer. destination is a 32-bit integer in a single register;
+            // bit7 selects round-toward-zero (vcvt) over round-per-FPSCR (vcvtr).
+            let to = if opc2 == 0b1101 { VfpType::S32 } else { VfpType::U32 };
+            let round = !bit7;
+            let dd = vfp_reg(false, Vd, D);
+            let dm = vfp_reg(sz, Vm, M);
+            Ok((Opcode::VCVT { to, from: fp_ty, round }, [
+                Operand::SIMDReg(dd), Operand::SIMDReg(dm), Operand::Nothing, Operand::Nothing,
+            ]))
+        }
+        _ => Err(DecodeError::InvalidOpcode),
+    }
 }
 
 /// the VFP register-transfer forms: VMSR, VMRS, VMOV (core<->single, and the 64-bit core-pair
