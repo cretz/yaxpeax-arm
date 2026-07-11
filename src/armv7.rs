@@ -727,6 +727,116 @@ pub(crate) fn decode_neon_loadstore(word: u32) -> Result<(Opcode, [Operand; 4]),
     Ok((opcode, [list, deref, Operand::Nothing, Operand::Nothing]))
 }
 
+/// ARM `VFPExpandImm(imm8, 32)`: expand a VFP `vmov.f32` 8-bit immediate to its f32 bit pattern.
+fn vfp_expand_imm32(imm8: u8) -> u32 {
+    let sign = ((imm8 >> 7) & 1) as u32;
+    let b6 = ((imm8 >> 6) & 1) as u32;
+    let frac = (imm8 & 0b11_1111) as u32;
+    (sign << 31) | ((1 - b6) << 30) | (if b6 == 1 { 0x1f } else { 0 } << 25) | (frac << 19)
+}
+
+/// ARM `VFPExpandImm(imm8, 64)`: expand a VFP `vmov.f64` 8-bit immediate to its f64 bit pattern.
+fn vfp_expand_imm64(imm8: u8) -> u64 {
+    let sign = ((imm8 >> 7) & 1) as u64;
+    let b6 = ((imm8 >> 6) & 1) as u64;
+    let frac = (imm8 & 0b11_1111) as u64;
+    (sign << 63) | ((1 - b6) << 62) | (if b6 == 1 { 0xff } else { 0 } << 54) | (frac << 48)
+}
+
+/// ARM `AdvSIMDExpandImm`: expand the `(op, cmode, imm8)` of a NEON one-register-modified-immediate
+/// into the 64-bit value each doubleword register lane receives. Only the value is returned; the
+/// caller pairs it with the opcode. Covers the VMOV/VMVN immediate `cmode` cases (the f32 `cmode ==
+/// 0b1111` form is expanded too).
+fn adv_simd_expand_imm(op: u8, cmode: u8, imm8: u8) -> u64 {
+    let b = imm8 as u64;
+    let rep32 = |x: u64| x | (x << 32); // replicate a 32-bit unit across the doubleword
+    let rep16 = |x: u64| {
+        let x = x & 0xffff;
+        x | (x << 16) | (x << 32) | (x << 48)
+    };
+    match cmode >> 1 {
+        0b000 => rep32(b),
+        0b001 => rep32(b << 8),
+        0b010 => rep32(b << 16),
+        0b011 => rep32(b << 24),
+        0b100 => rep16(b),
+        0b101 => rep16(b << 8),
+        0b110 => {
+            // one byte of `imm8` surrounded by ones (`cmode[0]` picks 8- or 16-bit fill).
+            let v = if cmode & 1 == 0 { (b << 8) | 0xff } else { (b << 16) | 0xffff };
+            rep32(v)
+        }
+        _ => {
+            // cmode == 0b1110 / 0b1111
+            if cmode & 1 == 0 {
+                if op == 0 {
+                    // i8: replicate the byte across all 8 lanes.
+                    let mut v = 0u64;
+                    for i in 0..8 {
+                        v |= b << (8 * i);
+                    }
+                    v
+                } else {
+                    // i64: each bit of imm8 fills the corresponding byte with 0x00 or 0xff.
+                    let mut v = 0u64;
+                    for i in 0..8 {
+                        if b & (1 << i) != 0 {
+                            v |= 0xffu64 << (8 * i);
+                        }
+                    }
+                    v
+                }
+            } else {
+                // f32: aBbbbbbc defgh000 expanded then replicated across two 32-bit lanes.
+                let bit = |n: u32| ((b >> n) & 1) as u64;
+                let val = (bit(7) << 31)
+                    | ((1 - bit(6)) << 30)
+                    | (if bit(6) == 1 { 0x1fu64 << 25 } else { 0 })
+                    | ((b & 0x3f) << 19);
+                rep32(val)
+            }
+        }
+    }
+}
+
+/// decode a NEON "one register and modified immediate" data-processing instruction (`vmov`/`vmvn`
+/// immediate, and the `vorr`/`vbic` immediate accumulate forms), given the full A32-form word. the
+/// destination is a `Qd` (bit6 set) or `Dd`; the expanded 64-bit lane value is returned as the
+/// low/high halves in two `Imm` operands so callers get the whole pattern.
+#[allow(non_snake_case)]
+fn decode_neon_dp_1reg_imm(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let cmode = ((word >> 8) & 0b1111) as u8;
+    let op = ((word >> 5) & 1) as u8;
+    let Q = (word >> 6) & 1 != 0;
+    let D = ((word >> 22) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let i = ((word >> 24) & 1) as u8;
+    let imm3 = ((word >> 16) & 0b111) as u8;
+    let imm4 = (word & 0b1111) as u8;
+    let imm8 = (i << 7) | (imm3 << 4) | imm4;
+
+    // Only the VMOV-immediate (`op == 0`) form is lifted; the VMVN/VORR/VBIC-immediate (`op == 1`)
+    // forms are not needed by the cube and need their own opcodes, so defer them.
+    if op == 1 {
+        return Err(DecodeError::Incomplete);
+    }
+
+    let dd_num = (D << 4) | Vd;
+    let dest = if Q {
+        Operand::SIMDReg(SIMDReg::new(SIMDSizeCode::Q, dd_num >> 1))
+    } else {
+        Operand::SIMDReg(SIMDReg::new(SIMDSizeCode::D, dd_num))
+    };
+
+    // The expanded 64-bit lane value is returned as two `Imm` operands (low, high) so the caller
+    // gets the whole doubleword pattern regardless of element size.
+    let value = adv_simd_expand_imm(op, cmode, imm8);
+    Ok((
+        Opcode::VMOV,
+        [dest, Operand::Imm(value as u32), Operand::Imm((value >> 32) as u32), Operand::Nothing],
+    ))
+}
+
 /// build a VFP register from the `Vx`/`x` field split used throughout the VFP encodings. for a
 /// single-precision (`sz == false`) register the number is `(Vx << 1) | x`; for double precision
 /// (`sz == true`) it is `(x << 4) | Vx`.
@@ -919,10 +1029,31 @@ fn decode_vfp_other(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
         Ok((op, [Operand::SIMDReg(dd), Operand::SIMDReg(dm), Operand::Nothing, Operand::Nothing]))
     };
 
-    // bit6 == 0 is the VMOV-immediate form (bits 7:4 == 0000). its display requires expanding the
-    // 8-bit encoded value to capstone's `%e` float text, which is deferred for now.
+    // bit6 == 0 is the VMOV-immediate form (`vmov.f32/f64 dd, #imm`), valid only when opc2's
+    // sub-fields and bits[7:4] are zero. Expand the 8-bit encoding (`VFPExpandImm`) and carry the
+    // resulting float bit pattern as `Imm` operand(s) (one for f32, low/high pair for f64).
     if (word >> 6) & 1 == 0 {
-        return Err(DecodeError::InvalidOpcode);
+        if (word >> 4) & 0b11 != 0 {
+            return Err(DecodeError::InvalidOpcode);
+        }
+        let imm8 = ((((word >> 16) & 0b1111) << 4) | (word & 0b1111)) as u8;
+        if sz {
+            let bits = vfp_expand_imm64(imm8);
+            return Ok((Opcode::VMOV, [
+                Operand::SIMDReg(dd),
+                Operand::Imm(bits as u32),
+                Operand::Imm((bits >> 32) as u32),
+                Operand::Nothing,
+            ]));
+        } else {
+            let bits = vfp_expand_imm32(imm8);
+            return Ok((Opcode::VMOV, [
+                Operand::SIMDReg(dd),
+                Operand::Imm(bits),
+                Operand::Nothing,
+                Operand::Nothing,
+            ]));
+        }
     }
 
     match opc2 {
@@ -1182,6 +1313,27 @@ pub(crate) fn decode_thumb_coproc(hw1: u16, hw2: u16) -> Result<(Opcode, [Operan
 
     // generic coprocessor (STC/LDC/MCR/MRC/CDP...) and NEON data-processing are not yet decoded.
     Err(DecodeError::Incomplete)
+}
+
+/// decode a Thumb-2 Advanced-SIMD data-processing instruction by mapping it onto the equivalent
+/// A32 encoding. The Thumb form is `111 U 1111 ...`; the A32 form is `1111 001 U ...` with bits[23:0]
+/// identical, so we splice the `U` bit into the A32 top byte and reuse the A32 decoders. Only the
+/// one-register-and-modified-immediate `vmov` form is decoded today.
+pub(crate) fn decode_thumb_neon_dp(hw1: u16, hw2: u16) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let thumb = ((hw1 as u32) << 16) | (hw2 as u32);
+    let u = (thumb >> 28) & 1;
+    let a32 = 0xf200_0000 | (u << 24) | (thumb & 0x00ff_ffff);
+
+    // "one register and modified immediate": bit23 == 1, bits[21:19] == 000, bit7 == 0, bit4 == 1.
+    let is_1reg_imm = (a32 >> 23) & 1 == 1
+        && (a32 >> 19) & 0b111 == 0
+        && (a32 >> 7) & 1 == 0
+        && (a32 >> 4) & 1 == 1;
+    if is_1reg_imm {
+        decode_neon_dp_1reg_imm(a32)
+    } else {
+        Err(DecodeError::Incomplete)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

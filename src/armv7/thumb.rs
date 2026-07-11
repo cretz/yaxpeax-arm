@@ -3,7 +3,7 @@ use yaxpeax_arch::Arch;
 use crate::armv7::{
     ARMv7, ConditionCode, DecodeError, CReg, Reg, Reader, RegShift,
     Operand, Opcode, Instruction, InstDecoder, StatusRegMask,
-    decode_thumb_coproc,
+    decode_thumb_coproc, decode_thumb_neon_dp,
 };
 
 use bitvec::prelude::*;
@@ -4284,8 +4284,15 @@ fn decode_table_a6_30(decoder: &InstDecoder, inst: &mut Instruction, instr2: Bit
         ];
         return Err(DecodeError::InvalidOpcode);
     } else if op1 & 0b110000 == 0b110000 {
-        // TODO: `Advanced SIMD data-processing instructions on A7-259`
-        return Err(DecodeError::Incomplete);
+        // `Advanced SIMD data-processing instructions` (A7-259). Only the one-register-and-
+        // modified-immediate `vmov` form is decoded (via the shared A32 decoder); the rest is
+        // still TODO.
+        let hw1 = instr2[0..16].load::<u16>();
+        let hw2 = lower2[0..16].load::<u16>();
+        let (opcode, operands) = decode_thumb_neon_dp(hw1, hw2)?;
+        inst.opcode = opcode;
+        inst.operands = operands;
+        return Ok(());
     } else {
         let coproc = lower2[8..12].load::<u8>();
         if coproc & 0b1110 != 0b1010 {
