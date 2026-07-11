@@ -293,6 +293,10 @@ pub enum Opcode {
     VLDM(bool),
     /// `vstm` with the increment-after (`true`) or decrement-before (`false`) addressing mode.
     VSTM(bool),
+    /// deprecated `fldmiax`/`fldmdbx` (the "X", extra-word, load-multiple form).
+    VLDMX(bool),
+    /// deprecated `fstmiax`/`fstmdbx` (the "X", extra-word, store-multiple form).
+    VSTMX(bool),
     VDUP,
     /// `vcvt`/`vcvtr` between floating-point and integer/fixed, and between f32 and f64. the
     /// full data-type suffix is derived from the operands and the stored round-to-zero flag.
@@ -688,8 +692,99 @@ fn decode_vfp(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
         }
     }
 
+    if ((word >> 25) & 0b111) == 0b110 {
+        // `cccc 110x ...` extension-register load/store (coproc 101x).
+        return decode_vfp_loadstore(word);
+    }
+
     let _ = (op23, N);
     Err(DecodeError::InvalidOpcode)
+}
+
+/// the VFP extension-register load/store group (`cccc 110x ...`): VLDR, VSTR, VLDM, VSTM, VPUSH,
+/// VPOP. also routes the 64-bit core<->register transfers to the transfer decoder.
+#[allow(non_snake_case)]
+fn decode_vfp_loadstore(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let sz = (word >> 8) & 1 != 0; // 0 -> single (a2), 1 -> double (a1)
+    let P = (word >> 24) & 1 != 0;
+    let U = (word >> 23) & 1 != 0;
+    let D = ((word >> 22) & 1) as u8;
+    let W = (word >> 21) & 1 != 0;
+    let L = (word >> 20) & 1 != 0;
+    let Rn = ((word >> 16) & 0b1111) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let imm8 = (word & 0xff) as u16;
+
+    if !P && !U {
+        // 64-bit core<->register transfers, or undefined; handled elsewhere.
+        return decode_vfp_transfer(word);
+    }
+
+    let dreg = vfp_reg(sz, Vd, D);
+
+    if P && !W {
+        // VLDR / VSTR (single register, immediate offset).
+        let opcode = if L { Opcode::VLDR } else { Opcode::VSTR };
+        let offset = imm8 << 2;
+        return Ok((opcode, [
+            Operand::SIMDReg(dreg),
+            Operand::RegDerefPreindexOffset(Reg::from_u8(Rn), offset, U, false),
+            Operand::Nothing,
+            Operand::Nothing,
+        ]));
+    }
+
+    // VLDM / VSTM (and the VPUSH / VPOP aliases). addressing: IA when U (P==0), DB when !U (P==1).
+    if P == U {
+        // P==1,U==1 or P==0,U==0 are not valid load-multiple forms.
+        return Err(DecodeError::InvalidOpcode);
+    }
+    let increment_after = U; // IA vs DB
+    // for the double-precision (a1) form an odd imm8 selects the deprecated FLDMX/FSTMX encoding,
+    // which carries one extra word; the register count is then `(imm8 - 1) / 2`.
+    let is_fldmx = sz && (imm8 & 1 == 1);
+    let mut count = if sz {
+        if is_fldmx { ((imm8 - 1) >> 1) as u8 } else { (imm8 >> 1) as u8 }
+    } else {
+        imm8 as u8
+    };
+    if count == 0 {
+        return Err(DecodeError::InvalidOperand);
+    }
+    // a VLDM/VSTM list holds at most 16 doubleword or 32 singleword registers (and never runs past
+    // the end of the register file); clamp the printed list to match capstone on the unpredictable
+    // over-long encodings.
+    let max_count = if sz { 16 } else { 32 };
+    count = count.min(max_count).min(32u8.saturating_sub(dreg.num));
+    let list = Operand::SIMDRegList(dreg, count);
+
+    if is_fldmx {
+        let opcode = if L { Opcode::VLDMX(increment_after) } else { Opcode::VSTMX(increment_after) };
+        return Ok((opcode, [
+            Operand::RegWBack(Reg::from_u8(Rn), W),
+            list,
+            Operand::Nothing,
+            Operand::Nothing,
+        ]));
+    }
+
+    // VPUSH == VSTMDB sp!, VPOP == VLDMIA sp!.
+    if Rn == 13 && W {
+        if !increment_after && !L {
+            return Ok((Opcode::VPUSH, [list, Operand::Nothing, Operand::Nothing, Operand::Nothing]));
+        }
+        if increment_after && L {
+            return Ok((Opcode::VPOP, [list, Operand::Nothing, Operand::Nothing, Operand::Nothing]));
+        }
+    }
+
+    let opcode = if L { Opcode::VLDM(increment_after) } else { Opcode::VSTM(increment_after) };
+    Ok((opcode, [
+        Operand::RegWBack(Reg::from_u8(Rn), W),
+        list,
+        Operand::Nothing,
+        Operand::Nothing,
+    ]))
 }
 
 /// the VFP "other" data-processing group (`cccc 11101D11 ...`): VMOV(imm), VMOV(reg), VABS, VNEG,

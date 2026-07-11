@@ -688,7 +688,7 @@ pub(crate) fn visit_inst<T: DisplaySink>(instr: &Instruction, out: &mut T) -> fm
         | Opcode::VFMS | Opcode::VFNMA | Opcode::VFNMS | Opcode::VABS | Opcode::VNEG
         | Opcode::VSQRT | Opcode::VMOV | Opcode::VCMP(_) | Opcode::VMRS | Opcode::VMSR
         | Opcode::VLDR | Opcode::VSTR | Opcode::VPUSH | Opcode::VPOP | Opcode::VLDM(_)
-        | Opcode::VSTM(_) | Opcode::VDUP | Opcode::VCVT => {
+        | Opcode::VSTM(_) | Opcode::VLDMX(_) | Opcode::VSTMX(_) | Opcode::VDUP | Opcode::VCVT => {
             out.span_start_opcode();
             instr.write_conditioned_opcode(&instr.opcode, out)?;
             if let Some(suffix) = vfp_suffix(instr) {
@@ -1107,6 +1107,8 @@ impl <T: fmt::Write, Y: YaxColors> Colorize<T, Y> for ConditionedOpcode {
             Opcode::VPOP |
             Opcode::VLDM(_) |
             Opcode::VSTM(_) |
+            Opcode::VLDMX(_) |
+            Opcode::VSTMX(_) |
             Opcode::VDUP |
             Opcode::VCVT => { write!(out, "{}", colors.arithmetic_op(self)) },
         }
@@ -1396,6 +1398,10 @@ impl Opcode {
             Opcode::VLDM(false) => { "vldmdb" },
             Opcode::VSTM(true) => { "vstmia" },
             Opcode::VSTM(false) => { "vstmdb" },
+            Opcode::VLDMX(true) => { "fldmiax" },
+            Opcode::VLDMX(false) => { "fldmdbx" },
+            Opcode::VSTMX(true) => { "fstmiax" },
+            Opcode::VSTMX(false) => { "fstmdbx" },
             Opcode::VDUP => { "vdup" },
             Opcode::VCVT => { "vcvt" },
         }
