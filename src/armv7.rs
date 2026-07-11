@@ -642,10 +642,9 @@ fn decode_vfp(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
     let Vn = ((word >> 16) & 0b1111) as u8;
     let Vm = (word & 0b1111) as u8;
 
-    let op24 = (word >> 24) & 1;
     let op23 = (word >> 23) & 1;
 
-    if op24 == 1 && ((word >> 25) & 0b111) == 0b111 {
+    if (word >> 24) & 0b1111 == 0b1110 {
         // `cccc 1110 ...` data-processing / register transfer (bits 27:24 == 0b1110).
         let opc1 = ((word >> 20) & 0b1111) as u8; // includes the D bit at position 2
         let op6 = ((word >> 6) & 1) as u8;
@@ -799,31 +798,46 @@ fn decode_vfp_other(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
     let opc2 = ((word >> 16) & 0b1111) as u8;
     let op6 = ((word >> 6) & 1) as u8; // for most, distinguishes the two ops sharing opc2
 
+    let bit7 = (word >> 7) & 1 != 0;
+    let _ = op6;
+
     let dd = vfp_reg(sz, Vd, D);
     let dm = vfp_reg(sz, Vm, M);
     let two = |op: Opcode| {
         Ok((op, [Operand::SIMDReg(dd), Operand::SIMDReg(dm), Operand::Nothing, Operand::Nothing]))
     };
 
-    match (opc2, op6) {
-        (0b0000, 0) => two(Opcode::VMOV), // VMOV (register)
-        (0b0000, 1) => two(Opcode::VABS),
-        (0b0001, 0) => two(Opcode::VNEG),
-        (0b0001, 1) => two(Opcode::VSQRT),
-        (0b0100, _) => Ok((Opcode::VCMP(op6 != 0), [
-            Operand::SIMDReg(dd), Operand::SIMDReg(dm), Operand::Nothing, Operand::Nothing,
-        ])), // VCMP / VCMPE
-        (0b0101, _) => {
-            // VCMP (with zero): the m field must be zero.
-            if Vm != 0 || M != 0 {
-                return Err(DecodeError::InvalidOperand);
-            }
-            Ok((Opcode::VCMP(op6 != 0), [
-                Operand::SIMDReg(dd), Operand::Imm(0), Operand::Nothing, Operand::Nothing,
-            ]))
-        }
-        _ => Err(DecodeError::InvalidOpcode),
+    // bit6 == 0 is the VMOV-immediate form (bits 7:4 == 0000). its display requires expanding the
+    // 8-bit encoded value to capstone's `%e` float text, which is deferred for now.
+    if (word >> 6) & 1 == 0 {
+        return Err(DecodeError::InvalidOpcode);
     }
+
+    match opc2 {
+        0b0000 => if bit7 { two(Opcode::VABS) } else { two(Opcode::VMOV) },
+        0b0001 => if bit7 { two(Opcode::VSQRT) } else { two(Opcode::VNEG) },
+        0b0100 | 0b0101 => {
+            // VCMP / VCMPE; opc2 == 0b0101 compares against zero (m field must be 0).
+            if opc2 == 0b0101 {
+                if Vm != 0 || M != 0 {
+                    return Err(DecodeError::InvalidOperand);
+                }
+                Ok((Opcode::VCMP(bit7), [
+                    Operand::SIMDReg(dd), Operand::Imm(0), Operand::Nothing, Operand::Nothing,
+                ]))
+            } else {
+                two(Opcode::VCMP(bit7))
+            }
+        }
+        _ => decode_vfp_cvt(word),
+    }
+}
+
+/// the VFP conversion sub-group of the "other" data-processing ops (VCVT between float and
+/// integer/fixed, and between f32 and f64). not yet implemented (`InvalidOpcode`).
+#[allow(non_snake_case)]
+fn decode_vfp_cvt(_word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    Err(DecodeError::InvalidOpcode)
 }
 
 /// the VFP register-transfer forms: VMSR, VMRS, VMOV (core<->single, and the 64-bit core-pair

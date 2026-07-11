@@ -724,7 +724,9 @@ pub(crate) fn visit_inst<T: DisplaySink>(instr: &Instruction, out: &mut T) -> fm
             instr.write_conditioned_opcode(&instr.opcode, out)?;
             out.span_end_opcode();
             out.write_char(' ')?;
-            if rt.number() == 15 {
+            // Rt == 15 reading FPSCR is the `apsr_nzcv` transfer; for other system registers it is
+            // just the (unpredictable) pc.
+            if rt.number() == 15 && *sysreg == 1 {
                 out.write_fixed_size("apsr_nzcv")?;
             } else {
                 out.write_reg(rt.number())?;
