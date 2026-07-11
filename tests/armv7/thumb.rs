@@ -491,7 +491,7 @@ fn test_decode_adr_cases() {
 fn test_decode_bcc_cases() {
     test_display(
         &[0xfe, 0xe7],
-        "b $-0x4"
+        "b $+0x0"
     );
     test_display(
         &[0x80, 0x47],
@@ -559,217 +559,217 @@ fn test_decode_bcc_cases() {
     );
     test_display(
         &[0xfe, 0xd0],
-        "beq $-0x2"
+        "beq $+0x0"
     );
     test_display(
         &[0xfe, 0xd1],
-        "bne $-0x2"
+        "bne $+0x0"
     );
     test_display(
         &[0xfe, 0xd2],
-        "bhs $-0x2"
+        "bhs $+0x0"
     );
     test_display(
         &[0xfe, 0xd3],
-        "blo $-0x2"
+        "blo $+0x0"
     );
     test_display(
         &[0xfe, 0xd4],
-        "bmi $-0x2"
+        "bmi $+0x0"
     );
     test_display(
         &[0xfe, 0xd5],
-        "bpl $-0x2"
+        "bpl $+0x0"
     );
     test_display(
         &[0xfe, 0xd6],
-        "bvs $-0x2"
+        "bvs $+0x0"
     );
     test_display(
         &[0xfe, 0xd7],
-        "bvc $-0x2"
+        "bvc $+0x0"
     );
     test_display(
         &[0xfe, 0xd8],
-        "bhi $-0x2"
+        "bhi $+0x0"
     );
     test_display(
         &[0xfe, 0xd9],
-        "bls $-0x2"
+        "bls $+0x0"
     );
     test_display(
         &[0xfe, 0xda],
-        "bge $-0x2"
+        "bge $+0x0"
     );
     test_display(
         &[0xfe, 0xdb],
-        "blt $-0x2"
+        "blt $+0x0"
     );
     test_display(
         &[0xfe, 0xdc],
-        "bgt $-0x2"
+        "bgt $+0x0"
     );
     test_display(
         &[0xfe, 0xdd],
-        "ble $-0x2"
+        "ble $+0x0"
     );
     test_display(
         &[0xd3, 0xd0],
-        "beq $-0x58"
+        "beq $-0x56"
     );
     test_display(
         &[0xd3, 0xd1],
-        "bne $-0x58"
+        "bne $-0x56"
     );
     test_display(
         &[0xd3, 0xd2],
-        "bhs $-0x58"
+        "bhs $-0x56"
     );
     test_display(
         &[0xd3, 0xd3],
-        "blo $-0x58"
+        "blo $-0x56"
     );
     test_display(
         &[0xd3, 0xd4],
-        "bmi $-0x58"
+        "bmi $-0x56"
     );
     test_display(
         &[0xd3, 0xd5],
-        "bpl $-0x58"
+        "bpl $-0x56"
     );
     test_display(
         &[0xd3, 0xd6],
-        "bvs $-0x58"
+        "bvs $-0x56"
     );
     test_display(
         &[0xd3, 0xd7],
-        "bvc $-0x58"
+        "bvc $-0x56"
     );
     test_display(
         &[0xd3, 0xd8],
-        "bhi $-0x58"
+        "bhi $-0x56"
     );
     test_display(
         &[0xd3, 0xd9],
-        "bls $-0x58"
+        "bls $-0x56"
     );
     test_display(
         &[0xd3, 0xda],
-        "bge $-0x58"
+        "bge $-0x56"
     );
     test_display(
         &[0xd3, 0xdb],
-        "blt $-0x58"
+        "blt $-0x56"
     );
     test_display(
         &[0xd3, 0xdc],
-        "bgt $-0x58"
+        "bgt $-0x56"
     );
     test_display(
         &[0xd3, 0xdd],
-        "ble $-0x58"
+        "ble $-0x56"
     );
     test_display(
         &[0xfd, 0xd0],
-        "beq $-0x4"
+        "beq $-0x2"
     );
     test_display(
         &[0xfd, 0xd1],
-        "bne $-0x4"
+        "bne $-0x2"
     );
     test_display(
         &[0xfd, 0xd2],
-        "bhs $-0x4"
+        "bhs $-0x2"
     );
     test_display(
         &[0xfd, 0xd3],
-        "blo $-0x4"
+        "blo $-0x2"
     );
     test_display(
         &[0xfd, 0xd4],
-        "bmi $-0x4"
+        "bmi $-0x2"
     );
     test_display(
         &[0xfd, 0xd5],
-        "bpl $-0x4"
+        "bpl $-0x2"
     );
     test_display(
         &[0xfd, 0xd6],
-        "bvs $-0x4"
+        "bvs $-0x2"
     );
     test_display(
         &[0xfd, 0xd7],
-        "bvc $-0x4"
+        "bvc $-0x2"
     );
     test_display(
         &[0xfd, 0xd8],
-        "bhi $-0x4"
+        "bhi $-0x2"
     );
     test_display(
         &[0xfd, 0xd9],
-        "bls $-0x4"
+        "bls $-0x2"
     );
     test_display(
         &[0xfd, 0xda],
-        "bge $-0x4"
+        "bge $-0x2"
     );
     test_display(
         &[0xfd, 0xdb],
-        "blt $-0x4"
+        "blt $-0x2"
     );
     test_display(
         &[0xfd, 0xdc],
-        "bgt $-0x4"
+        "bgt $-0x2"
     );
     test_display(
         &[0xfd, 0xdd],
-        "ble $-0x4"
+        "ble $-0x2"
     );
 }
 #[test]
 fn test_decode_32b_branch_cases() {
     test_display(
         &[0xf3, 0xf7, 0x7c, 0xbe],
-        "b.w $-0xc308"
+        "b.w $-0xc304"
     );
     test_display(
         &[0x0c, 0xf0, 0x84, 0xb9],
-        "b.w $+0xc308"
+        "b.w $+0xc30c"
     );
     test_display(
         &[0x00, 0xf4, 0x00, 0x90],
-        "b.w $-0x1000000"
+        "b.w $-0xfffffc"
     );
     test_display(
         &[0xff, 0xf3, 0xff, 0x97],
-        "b.w $+0xfffffe"
+        "b.w $+0x1000002"
     );
     test_display(
         &[0x00, 0xf4, 0x00, 0xc0],
-        "blx.w $-0x1000000"
+        "blx.w $-0xfffffc"
     );
     test_display(
         &[0xff, 0xf3, 0xfe, 0xc7],
-        "blx.w $+0xfffffc"
+        "blx.w $+0x1000000"
     );
     test_display(
         &[0x00, 0xf4, 0x00, 0xd0],
-        "bl.w $-0x1000000"
+        "bl.w $-0xfffffc"
     );
     test_display(
         &[0xff, 0xf3, 0xff, 0xd7],
-        "bl.w $+0xfffffe"
+        "bl.w $+0x1000002"
     );
     test_display(
         &[0x3f, 0xf4, 0xfe, 0xaf],
-        "b.weq $-0x4"
+        "b.weq $+0x0"
     );
     // Test for yaxpeax-arm #3
     // branch target was 0x12198 in initial test case at offset 0x82fc
     // 0x12198 - 0x82fc - 0x4 (offsets taken after IP already incremented)
     test_display(
         &[0x09, 0xf0, 0x4c, 0xbf],
-        "b.w $+0x9e98"
+        "b.w $+0x9e9c"
     );
 }
 #[test]
@@ -1306,51 +1306,51 @@ fn test_decode_bx_cases() {
 fn test_decode_cbz_cbnz_cases() {
     test_display(
         &[0x01, 0xb1],
-        "cbz r1, $+0x2" // original test: 0x4. assume address is 0, so $ is 2, +2 makes 4?
+        "cbz r1, $+0x4" // original test: 0x4. assume address is 0, so $ is 2, +2 makes 4?
     );
     test_display(
         &[0x01, 0xb3],
-        "cbz r1, $+0x42" // original test: 0x4. assume address is 0, so $ is 2, +2 makes 4?
+        "cbz r1, $+0x44" // original test: 0x4. assume address is 0, so $ is 2, +2 makes 4?
     );
     test_display(
         &[0x01, 0xb9],
-        "cbnz r1, $+0x2" // original test: 0x4. assume address is 0, so $ is 2, +2 makes 4?
+        "cbnz r1, $+0x4" // original test: 0x4. assume address is 0, so $ is 2, +2 makes 4?
     );
     test_display(
         &[0x01, 0xbb],
-        "cbnz r1, $+0x42" // original test: 0x4. assume address is 0, so $ is 2, +2 makes 4?
+        "cbnz r1, $+0x44" // original test: 0x4. assume address is 0, so $ is 2, +2 makes 4?
     );
     test_display(
         &[0x07, 0xb1],
-        "cbz r7, $+0x2" // original test: 0x4. assume address is 0, so $ is 2, +2 makes 4?
+        "cbz r7, $+0x4" // original test: 0x4. assume address is 0, so $ is 2, +2 makes 4?
     );
     test_display(
         &[0x07, 0xb3],
-        "cbz r7, $+0x42"
+        "cbz r7, $+0x44"
     );
     test_display(
         &[0x07, 0xb9],
-        "cbnz r7, $+0x2"
+        "cbnz r7, $+0x4"
     );
     test_display(
         &[0x07, 0xbb],
-        "cbnz r7, $+0x42"
+        "cbnz r7, $+0x44"
     );
     test_display(
         &[0xff, 0xb1],
-        "cbz r7, $+0x40"
+        "cbz r7, $+0x42"
     );
     test_display(
         &[0xff, 0xb3],
-        "cbz r7, $+0x80"
+        "cbz r7, $+0x82"
     );
     test_display(
         &[0xff, 0xb9],
-        "cbnz r7, $+0x40"
+        "cbnz r7, $+0x42"
     );
     test_display(
         &[0xff, 0xbb],
-        "cbnz r7, $+0x80"
+        "cbnz r7, $+0x82"
     );
 }
 #[test]
@@ -3210,39 +3210,39 @@ fn test_decode_rev_cases() {
 fn test_decode_stm_16b_cases() {
     test_display(
         &[0x01, 0xc0],
-        "stmia r0!, {r0}"
+        "stm r0!, {r0}"
     );
     test_display(
         &[0x01, 0xc1],
-        "stmia r1!, {r0}"
+        "stm r1!, {r0}"
     );
     test_display(
         &[0x01, 0xc2],
-        "stmia r2!, {r0}"
+        "stm r2!, {r0}"
     );
     test_display(
         &[0x01, 0xc3],
-        "stmia r3!, {r0}"
+        "stm r3!, {r0}"
     );
     test_display(
         &[0x01, 0xc4],
-        "stmia r4!, {r0}"
+        "stm r4!, {r0}"
     );
     test_display(
         &[0x01, 0xc5],
-        "stmia r5!, {r0}"
+        "stm r5!, {r0}"
     );
     test_display(
         &[0x01, 0xc6],
-        "stmia r6!, {r0}"
+        "stm r6!, {r0}"
     );
     test_display(
         &[0x01, 0xc7],
-        "stmia r7!, {r0}"
+        "stm r7!, {r0}"
     );
     test_display(
         &[0xff, 0xc3],
-        "stmia r3!, {r0, r1, r2, r3, r4, r5, r6, r7}"
+        "stm r3!, {r0, r1, r2, r3, r4, r5, r6, r7}"
     );
 }
 #[test]
