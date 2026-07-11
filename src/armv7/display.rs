@@ -372,9 +372,111 @@ impl<T: DisplaySink> crate::armv7::OperandVisitor for DisplayingOperandVisitor<'
         Ok(())
     }
 
+    fn visit_simd_reg(&mut self, reg: crate::armv7::SIMDReg) -> Result<Self::Ok, Self::Error> {
+        self.f.span_start_register();
+        write_simd_reg(self.f, reg)?;
+        self.f.span_end_register();
+        Ok(())
+    }
+
+    fn visit_simd_reg_lane(&mut self, reg: crate::armv7::SIMDReg, lane: u8) -> Result<Self::Ok, Self::Error> {
+        self.f.span_start_register();
+        write_simd_reg(self.f, reg)?;
+        self.f.span_end_register();
+        self.f.write_char('[')?;
+        write_dec_u8(self.f, lane)?;
+        self.f.write_char(']')?;
+        Ok(())
+    }
+
+    fn visit_simd_reg_list(&mut self, first: crate::armv7::SIMDReg, count: u8) -> Result<Self::Ok, Self::Error> {
+        use crate::armv7::{SIMDReg, SIMDSizeCode};
+        self.f.write_char('{')?;
+        for i in 0..count {
+            if i != 0 {
+                self.f.write_fixed_size(", ")?;
+            }
+            let step: u8 = match first.size {
+                SIMDSizeCode::Q => 2,
+                _ => 1,
+            };
+            self.f.span_start_register();
+            write_simd_reg(self.f, SIMDReg::new(first.size, first.num.wrapping_add(i * step)))?;
+            self.f.span_end_register();
+        }
+        self.f.write_char('}')?;
+        Ok(())
+    }
+
+    fn visit_imm(&mut self, imm: u32) -> Result<Self::Ok, Self::Error> {
+        write_dec_u32(self.f, imm)
+    }
+
     fn visit_other(&mut self) -> Result<Self::Ok, Self::Error> {
         Ok(())
     }
+}
+
+/// the `.f32`/`.f64` data-type suffix for a VFP instruction, derived from the width of its
+/// register operands. returns `None` for instructions that carry no such suffix.
+fn vfp_suffix(instr: &Instruction) -> Option<&'static str> {
+    use crate::armv7::SIMDSizeCode;
+    match instr.opcode {
+        Opcode::VMLA | Opcode::VMLS | Opcode::VNMLA | Opcode::VNMLS | Opcode::VMUL
+        | Opcode::VNMUL | Opcode::VADD | Opcode::VSUB | Opcode::VDIV | Opcode::VFMA
+        | Opcode::VFMS | Opcode::VFNMA | Opcode::VFNMS | Opcode::VABS | Opcode::VNEG
+        | Opcode::VSQRT | Opcode::VMOV | Opcode::VCMP(_) => {
+            for op in instr.operands.iter() {
+                if let Operand::SIMDReg(r) = op {
+                    return Some(match r.size {
+                        SIMDSizeCode::S => ".f32",
+                        _ => ".f64",
+                    });
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// write a VFP/SIMD register name (`s0`, `d15`, `q3`).
+fn write_simd_reg<T: DisplaySink>(out: &mut T, reg: crate::armv7::SIMDReg) -> fmt::Result {
+    use crate::armv7::SIMDSizeCode;
+    let letter = match reg.size {
+        SIMDSizeCode::S => 's',
+        SIMDSizeCode::D => 'd',
+        SIMDSizeCode::Q => 'q',
+    };
+    out.write_char(letter)?;
+    write_dec_u8(out, reg.num)
+}
+
+/// write a `u8` as decimal (used for register numbers 0-31 and lane indices).
+fn write_dec_u8<T: DisplaySink>(out: &mut T, v: u8) -> fmt::Result {
+    if v >= 10 {
+        out.write_char((b'0' + v / 10) as char)?;
+    }
+    out.write_char((b'0' + v % 10) as char)?;
+    Ok(())
+}
+
+/// write a `u32` as plain decimal (VFP bare immediates).
+fn write_dec_u32<T: DisplaySink>(out: &mut T, mut v: u32) -> fmt::Result {
+    if v == 0 {
+        return out.write_char('0');
+    }
+    let mut buf = [0u8; 10];
+    let mut i = buf.len();
+    while v > 0 {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+    }
+    for &b in &buf[i..] {
+        out.write_char(b as char)?;
+    }
+    Ok(())
 }
 
 fn write_coproc<T: DisplaySink>(coproc: u8, out: &mut T) -> fmt::Result {
@@ -579,6 +681,40 @@ pub(crate) fn visit_inst<T: DisplaySink>(instr: &Instruction, out: &mut T) -> fm
             // opc2 is a 3-bit field
             out.write_char((opc2 + 0x30) as char)?;
 
+            return Ok(());
+        }
+        Opcode::VMLA | Opcode::VMLS | Opcode::VNMLA | Opcode::VNMLS | Opcode::VMUL
+        | Opcode::VNMUL | Opcode::VADD | Opcode::VSUB | Opcode::VDIV | Opcode::VFMA
+        | Opcode::VFMS | Opcode::VFNMA | Opcode::VFNMS | Opcode::VABS | Opcode::VNEG
+        | Opcode::VSQRT | Opcode::VMOV | Opcode::VCMP(_) | Opcode::VMRS | Opcode::VMSR
+        | Opcode::VLDR | Opcode::VSTR | Opcode::VPUSH | Opcode::VPOP | Opcode::VLDM(_)
+        | Opcode::VSTM(_) | Opcode::VDUP | Opcode::VCVT => {
+            out.span_start_opcode();
+            instr.write_conditioned_opcode(&instr.opcode, out)?;
+            if let Some(suffix) = vfp_suffix(instr) {
+                out.write_fixed_size(suffix)?;
+            }
+            out.span_end_opcode();
+
+            let mut ops = instr.operands.iter();
+            if let Some(first_op) = ops.next() {
+                if let Operand::Nothing = first_op {
+                    return Ok(());
+                }
+                out.write_char(' ')?;
+                let mut op_visitor = DisplayingOperandVisitor { f: out };
+                first_op.visit(&mut op_visitor)?;
+            } else {
+                return Ok(());
+            }
+            for op in ops {
+                if let Operand::Nothing = op {
+                    break;
+                }
+                out.write_fixed_size(", ")?;
+                let mut op_visitor = DisplayingOperandVisitor { f: out };
+                op.visit(&mut op_visitor)?;
+            }
             return Ok(());
         }
         _ => {}
@@ -944,6 +1080,35 @@ impl <T: fmt::Write, Y: YaxColors> Colorize<T, Y> for ConditionedOpcode {
             Opcode::MRRC(_, _, _) |
             Opcode::MRC(_, _, _, _) |
             Opcode::CDP(_, _, _, _) => { write!(out, "{}", colors.platform_op(self)) },
+
+            Opcode::VMLA |
+            Opcode::VMLS |
+            Opcode::VNMLA |
+            Opcode::VNMLS |
+            Opcode::VMUL |
+            Opcode::VNMUL |
+            Opcode::VADD |
+            Opcode::VSUB |
+            Opcode::VDIV |
+            Opcode::VFMA |
+            Opcode::VFMS |
+            Opcode::VFNMA |
+            Opcode::VFNMS |
+            Opcode::VABS |
+            Opcode::VNEG |
+            Opcode::VSQRT |
+            Opcode::VMOV |
+            Opcode::VCMP(_) |
+            Opcode::VMRS |
+            Opcode::VMSR |
+            Opcode::VLDR |
+            Opcode::VSTR |
+            Opcode::VPUSH |
+            Opcode::VPOP |
+            Opcode::VLDM(_) |
+            Opcode::VSTM(_) |
+            Opcode::VDUP |
+            Opcode::VCVT => { write!(out, "{}", colors.arithmetic_op(self)) },
         }
     }
 }
@@ -1201,6 +1366,38 @@ impl Opcode {
             Opcode::USUB8 => { "usub8" },
             Opcode::UQSUB8 => { "uqsub8" },
             Opcode::UHSUB8 => { "uhsub8" },
+
+            Opcode::VMLA => { "vmla" },
+            Opcode::VMLS => { "vmls" },
+            Opcode::VNMLA => { "vnmla" },
+            Opcode::VNMLS => { "vnmls" },
+            Opcode::VMUL => { "vmul" },
+            Opcode::VNMUL => { "vnmul" },
+            Opcode::VADD => { "vadd" },
+            Opcode::VSUB => { "vsub" },
+            Opcode::VDIV => { "vdiv" },
+            Opcode::VFMA => { "vfma" },
+            Opcode::VFMS => { "vfms" },
+            Opcode::VFNMA => { "vfnma" },
+            Opcode::VFNMS => { "vfnms" },
+            Opcode::VABS => { "vabs" },
+            Opcode::VNEG => { "vneg" },
+            Opcode::VSQRT => { "vsqrt" },
+            Opcode::VMOV => { "vmov" },
+            Opcode::VCMP(false) => { "vcmp" },
+            Opcode::VCMP(true) => { "vcmpe" },
+            Opcode::VMRS => { "vmrs" },
+            Opcode::VMSR => { "vmsr" },
+            Opcode::VLDR => { "vldr" },
+            Opcode::VSTR => { "vstr" },
+            Opcode::VPUSH => { "vpush" },
+            Opcode::VPOP => { "vpop" },
+            Opcode::VLDM(true) => { "vldmia" },
+            Opcode::VLDM(false) => { "vldmdb" },
+            Opcode::VSTM(true) => { "vstmia" },
+            Opcode::VSTM(false) => { "vstmdb" },
+            Opcode::VDUP => { "vdup" },
+            Opcode::VCVT => { "vcvt" },
         }
     }
 }
@@ -1356,6 +1553,18 @@ impl super::Operand {
             },
             Operand::CPSR => {
                 visitor.visit_cpsr()
+            },
+            Operand::SIMDReg(reg) => {
+                visitor.visit_simd_reg(reg)
+            },
+            Operand::SIMDRegLane(reg, lane) => {
+                visitor.visit_simd_reg_lane(reg, lane)
+            },
+            Operand::SIMDRegList(first, count) => {
+                visitor.visit_simd_reg_list(first, count)
+            },
+            Operand::Imm(imm) => {
+                visitor.visit_imm(imm)
             },
             Operand::Nothing => { panic!("tried to print Nothing operand") },
         }

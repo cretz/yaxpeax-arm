@@ -259,6 +259,44 @@ pub enum Opcode {
     UDIV,
     SMLALD(bool),
     SMLSLD(bool),
+
+    // VFP (floating-point) instructions. the `.f32`/`.f64` data-type suffix is derived at display
+    // time from the width of the register operands, except where noted.
+    VMLA,
+    VMLS,
+    VNMLA,
+    VNMLS,
+    VMUL,
+    VNMUL,
+    VADD,
+    VSUB,
+    VDIV,
+    VFMA,
+    VFMS,
+    VFNMA,
+    VFNMS,
+    VABS,
+    VNEG,
+    VSQRT,
+    /// `vmov` in all its forms (register, immediate, core<->scalar transfers); the concrete form is
+    /// distinguished by the operands.
+    VMOV,
+    /// `vcmp` (`false`) or `vcmpe` (`true`, signalling on NaN).
+    VCMP(bool),
+    VMRS,
+    VMSR,
+    VLDR,
+    VSTR,
+    VPUSH,
+    VPOP,
+    /// `vldm` with the increment-after (`true`) or decrement-before (`false`) addressing mode.
+    VLDM(bool),
+    /// `vstm` with the increment-after (`true`) or decrement-before (`false`) addressing mode.
+    VSTM(bool),
+    VDUP,
+    /// `vcvt`/`vcvtr` between floating-point and integer/fixed, and between f32 and f64. the
+    /// full data-type suffix is derived from the operands and the stored round-to-zero flag.
+    VCVT,
 }
 
 static DATA_PROCESSING_OPCODES: [Opcode; 16] = [
@@ -545,6 +583,161 @@ impl CReg {
     }
 }
 
+/// the width of a VFP/Advanced-SIMD (NEON) register operand. `S` is a 32-bit single-precision
+/// register (`s0`-`s31`), `D` a 64-bit doubleword register (`d0`-`d31`), and `Q` a 128-bit
+/// quadword register (`q0`-`q15`). the three views alias the same underlying register file.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum SIMDSizeCode {
+    S,
+    D,
+    Q,
+}
+
+/// a VFP/Advanced-SIMD register: a width (`S`/`D`/`Q`) and a register number. `S` numbers range
+/// 0-31, `D` 0-31, and `Q` 0-15.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SIMDReg {
+    /// the width of this register (single/double/quad).
+    pub size: SIMDSizeCode,
+    /// the register number.
+    pub num: u8,
+}
+
+impl SIMDReg {
+    #[inline]
+    fn new(size: SIMDSizeCode, num: u8) -> SIMDReg {
+        SIMDReg { size, num }
+    }
+}
+
+/// build a VFP register from the `Vx`/`x` field split used throughout the VFP encodings. for a
+/// single-precision (`sz == false`) register the number is `(Vx << 1) | x`; for double precision
+/// (`sz == true`) it is `(x << 4) | Vx`.
+#[inline]
+fn vfp_reg(sz: bool, vx: u8, x: u8) -> SIMDReg {
+    if sz {
+        SIMDReg::new(SIMDSizeCode::D, (x << 4) | vx)
+    } else {
+        SIMDReg::new(SIMDSizeCode::S, (vx << 1) | x)
+    }
+}
+
+/// decode the VFP (floating-point) coprocessor space (coproc `101x`). returns the opcode and
+/// operands, or a `DecodeError` if the encoding is not a (Cortex-A9 / VFPv3) VFP instruction.
+///
+/// this covers the `cccc 1110 ...` data-processing and register-transfer encodings and the
+/// `cccc 110x ...` extension-register load/store encodings. `word` is the full 32-bit instruction.
+#[allow(non_snake_case)]
+fn decode_vfp(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let sz = (word >> 8) & 1 != 0; // 0 -> f32 (single), 1 -> f64 (double)
+    let D = ((word >> 22) & 1) as u8;
+    let N = ((word >> 7) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vn = ((word >> 16) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+
+    let op24 = (word >> 24) & 1;
+    let op23 = (word >> 23) & 1;
+
+    if op24 == 1 && ((word >> 25) & 0b111) == 0b111 {
+        // `cccc 1110 ...` data-processing / register transfer (bits 27:24 == 0b1110).
+        let opc1 = ((word >> 20) & 0b1111) as u8; // includes the D bit at position 2
+        let op6 = ((word >> 6) & 1) as u8;
+
+        // the register-transfer forms have bit4 == 1; data-processing has bit4 == 0.
+        if (word >> 4) & 1 == 1 {
+            return decode_vfp_transfer(word);
+        }
+
+        // three-register (and the `1x11` "other") data-processing.
+        // opc1 bits (23,21,20) select the group; op6 selects within a pair.
+        let sel = (((word >> 23) & 1) << 2) | (((word >> 21) & 1) << 1) | ((word >> 20) & 1);
+        let dd = vfp_reg(sz, Vd, D);
+        let dn = vfp_reg(sz, Vn, N);
+        let dm = vfp_reg(sz, Vm, M);
+        let three = |op: Opcode| {
+            Ok((op, [
+                Operand::SIMDReg(dd),
+                Operand::SIMDReg(dn),
+                Operand::SIMDReg(dm),
+                Operand::Nothing,
+            ]))
+        };
+        let _ = opc1;
+        match (sel, op6) {
+            (0b000, 0) => return three(Opcode::VMLA),
+            (0b000, 1) => return three(Opcode::VMLS),
+            (0b001, 0) => return three(Opcode::VNMLS),
+            (0b001, 1) => return three(Opcode::VNMLA),
+            (0b010, 0) => return three(Opcode::VMUL),
+            (0b010, 1) => return three(Opcode::VNMUL),
+            (0b011, 0) => return three(Opcode::VADD),
+            (0b011, 1) => return three(Opcode::VSUB),
+            (0b100, 0) => return three(Opcode::VDIV),
+            (0b101, 0) => return three(Opcode::VFNMS),
+            (0b101, 1) => return three(Opcode::VFNMA),
+            (0b110, 0) => return three(Opcode::VFMA),
+            (0b110, 1) => return three(Opcode::VFMS),
+            (0b111, _) => {
+                // "other" data-processing: opc2 = Vn field selects the operation.
+                return decode_vfp_other(word);
+            }
+            _ => return Err(DecodeError::InvalidOpcode),
+        }
+    }
+
+    let _ = (op23, N);
+    Err(DecodeError::InvalidOpcode)
+}
+
+/// the VFP "other" data-processing group (`cccc 11101D11 ...`): VMOV(imm), VMOV(reg), VABS, VNEG,
+/// VSQRT, VCMP(E), VCVT and rounding variants. `opc2` (bits 19:16) plus bit6/bit7 select the op.
+#[allow(non_snake_case)]
+fn decode_vfp_other(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let sz = (word >> 8) & 1 != 0;
+    let D = ((word >> 22) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    let opc2 = ((word >> 16) & 0b1111) as u8;
+    let op6 = ((word >> 6) & 1) as u8; // for most, distinguishes the two ops sharing opc2
+
+    let dd = vfp_reg(sz, Vd, D);
+    let dm = vfp_reg(sz, Vm, M);
+    let two = |op: Opcode| {
+        Ok((op, [Operand::SIMDReg(dd), Operand::SIMDReg(dm), Operand::Nothing, Operand::Nothing]))
+    };
+
+    match (opc2, op6) {
+        (0b0000, 0) => two(Opcode::VMOV), // VMOV (register)
+        (0b0000, 1) => two(Opcode::VABS),
+        (0b0001, 0) => two(Opcode::VNEG),
+        (0b0001, 1) => two(Opcode::VSQRT),
+        (0b0100, _) => Ok((Opcode::VCMP(op6 != 0), [
+            Operand::SIMDReg(dd), Operand::SIMDReg(dm), Operand::Nothing, Operand::Nothing,
+        ])), // VCMP / VCMPE
+        (0b0101, _) => {
+            // VCMP (with zero): the m field must be zero.
+            if Vm != 0 || M != 0 {
+                return Err(DecodeError::InvalidOperand);
+            }
+            Ok((Opcode::VCMP(op6 != 0), [
+                Operand::SIMDReg(dd), Operand::Imm(0), Operand::Nothing, Operand::Nothing,
+            ]))
+        }
+        _ => Err(DecodeError::InvalidOpcode),
+    }
+}
+
+/// the VFP register-transfer forms (bit4 == 1 in the `cccc 1110 ...` space): VMSR, VMRS, VMOV
+/// (core to scalar / scalar to core), and VDUP. narrowed further by opcode fields.
+#[allow(non_snake_case)]
+fn decode_vfp_transfer(_word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    Err(DecodeError::InvalidOpcode)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[allow(non_camel_case_types)]
 #[allow(missing_docs)]
@@ -700,6 +893,17 @@ pub enum Operand {
     SPSR,
     /// the `cpsr` register.
     CPSR,
+    /// a VFP/Advanced-SIMD register (`s0`-`s31`, `d0`-`d31`, or `q0`-`q15`).
+    SIMDReg(SIMDReg),
+    /// a single lane of a VFP/Advanced-SIMD register, e.g. `d0[1]`. the `u8` is the lane index.
+    SIMDRegLane(SIMDReg, u8),
+    /// a contiguous list of VFP/Advanced-SIMD registers, e.g. `{d0, d1, d2, d3}`, as used by the
+    /// extension-register load/store instructions (`vldm`/`vstm`/`vpush`/`vpop`). fields are the
+    /// first register and the count of registers in the list.
+    SIMDRegList(SIMDReg, u8),
+    /// a bare immediate with no `#`-vs-value reinterpretation, printed as written. used for the
+    /// VFP `vmov` immediate encodings and fbits counts.
+    Imm(u32),
     /// "no operand". since an instruction's `operands` array is always four entries, this is used
     /// to fill space, if any, after recording an instruction's extant operands.
     Nothing,
@@ -771,6 +975,14 @@ pub trait OperandVisitor {
     fn visit_spsr(&mut self) -> Result<Self::Ok, Self::Error>;
     /// process an operand that is `CPSR`.
     fn visit_cpsr(&mut self) -> Result<Self::Ok, Self::Error>;
+    /// process an operand that is a VFP/Advanced-SIMD register.
+    fn visit_simd_reg(&mut self, reg: SIMDReg) -> Result<Self::Ok, Self::Error>;
+    /// process an operand that is a single lane of a VFP/Advanced-SIMD register.
+    fn visit_simd_reg_lane(&mut self, reg: SIMDReg, lane: u8) -> Result<Self::Ok, Self::Error>;
+    /// process an operand that is a contiguous list of VFP/Advanced-SIMD registers.
+    fn visit_simd_reg_list(&mut self, first: SIMDReg, count: u8) -> Result<Self::Ok, Self::Error>;
+    /// process an operand that is a bare immediate printed as written.
+    fn visit_imm(&mut self, imm: u32) -> Result<Self::Ok, Self::Error>;
     /// process an operand that is not defined above. there are no parameters as for an unknown
     /// operand kind there is no appropriate tuple of values to provide.
     fn visit_other(&mut self) -> Result<Self::Ok, Self::Error>;
@@ -2973,8 +3185,11 @@ impl Decoder<ARMv7> for InstDecoder {
                 let coproc = (word >> 8) as u8 & 0b1111;
 
                 if coproc & 0b1110 == 0b1010 {
-                    // Advanced SIMD, Floating-point, op1 = 0xxxxx
-                    return Err(DecodeError::Incomplete);
+                    // Advanced SIMD, Floating-point (coproc 101x) -> VFP decode.
+                    let (opcode, operands) = decode_vfp(word)?;
+                    inst.opcode = opcode;
+                    inst.operands = operands;
+                    return Ok(());
                 }
 
                 if (word >> 20) & 0b11010 == 0b00000 {
@@ -3082,8 +3297,11 @@ impl Decoder<ARMv7> for InstDecoder {
                 let coproc = (word >> 8) as u8 & 0b1111;
 
                 if coproc & 0b1110 == 0b1010 {
-                    // Advanced SIMD, Floating-point, op1 = 0xxxxx
-                    return Err(DecodeError::Incomplete);
+                    // Advanced SIMD, Floating-point (coproc 101x) -> VFP decode.
+                    let (opcode, operands) = decode_vfp(word)?;
+                    inst.opcode = opcode;
+                    inst.operands = operands;
+                    return Ok(());
                 }
 
                 if (word >> 4) & 1 == 0 {
