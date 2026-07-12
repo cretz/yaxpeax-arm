@@ -761,8 +761,11 @@ fn compare_one(
                 }
             }
         }
-        (Some(_), false) => {
+        (Some(cs_text), false) => {
             stats.cs_only.fetch_add(1, Ordering::Relaxed);
+            if std::env::var("ARMV7_DIFF_CSONLY").is_ok() {
+                eprintln!("CSONLY bytes={:02x?} cs=`{}`", bytes, cs_text.0);
+            }
         }
         (None, true) => {
             stats.yax_only.fetch_add(1, Ordering::Relaxed);

@@ -307,11 +307,131 @@ pub enum Opcode {
     /// and source data types are carried explicitly; `round` selects `vcvtr` (round per FPSCR)
     /// over `vcvt` (round toward zero) for the float-to-integer forms.
     VCVT { to: VfpType, from: VfpType, round: bool },
+    /// `vcvtb`/`vcvtt` converting between half precision (f16) and single precision (f32). `to_half`
+    /// picks the direction (`f32 -> f16` when true, `f16 -> f32` when false); `top` picks the top
+    /// (`vcvtt`) or bottom (`vcvtb`) 16-bit half of the single register that holds the f16.
+    VCVTHalf { to_half: bool, top: bool },
 
     /// NEON structure load `vld1`-`vld4`; the `u8` is the structure count (1-4).
     VLDN(u8, SIMDDataType),
     /// NEON structure store `vst1`-`vst4`; the `u8` is the structure count (1-4).
     VSTN(u8, SIMDDataType),
+
+    /// A NEON (Advanced SIMD) data-processing instruction. `op` names the operation; `dt` is the
+    /// element data type - the element size and, where the encoding's `U`/`op` bit distinguishes it,
+    /// signedness (`.s16`/`.u16`) or the plain integer form (`.i32`). Keeping the whole NEON
+    /// data-processing space under one opcode (rather than one top-level variant per mnemonic) keeps
+    /// the exhaustive `Opcode` matches elsewhere small; `NeonOp` carries the fan-out.
+    Neon { op: NeonOp, dt: SIMDDataType },
+}
+
+/// A NEON (Advanced SIMD) data-processing operation, grouped by its encoding class. The element data
+/// type travels alongside in [`Opcode::Neon`], so the same `NeonOp` covers a mnemonic's integer and
+/// floating-point forms (e.g. `vadd.i32` and `vadd.f32` are both [`NeonOp::VADD`], distinguished by
+/// the [`SIMDDataType`]).
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum NeonOp {
+    // Three registers of the same length.
+    VADD,
+    VSUB,
+    VMUL,
+    VMLA,
+    VMLS,
+    VMAX,
+    VMIN,
+    VPADD,
+    VABD,
+    // Three registers of different (widening) lengths: a `Qd` from two `Dn`/`Dm` (long), or a `Qd`
+    // from a `Qn` and a `Dm` (wide).
+    VADDL,
+    VADDW,
+    VSUBL,
+    VSUBW,
+    VMLAL,
+    VMLSL,
+    VMULL,
+    VABDL,
+    VABAL,
+    // Two registers, miscellaneous.
+    VPADDL,
+    VPADAL,
+    VABS,
+    VNEG,
+    // Two registers and a shift amount: the widening move `vmovl` (the demanded corner of the class;
+    // genuine `vshr`/`vshl`/`vshll` shifts are not decoded yet).
+    VMOVL,
+    // One register and a modified immediate: the integer `vmov.iN` broadcast. The single immediate
+    // operand is the per-element value (capstone's rendering); the `vmvn`/`vorr`/`vbic` and `vmov.f32`
+    // forms of the class are not decoded.
+    VMOVI,
+    // Three-registers-same bitwise logical family (`B == 0b0001, bit4 == 1`),
+    // selected by `U` and `size`. Element-size agnostic (whole-register bitwise).
+    VAND,
+    VBIC,
+    VORR,
+    VORN,
+    VEOR,
+    VBSL,
+    VBIT,
+    VBIF,
+    // Two registers and a shift amount (immediate). The shift amount rides in the last operand as
+    // an `Imm`. `VSLI`/`VSRI` also read the destination (they insert into it).
+    VSHR,
+    VSRA,
+    VSHL,
+    VSLI,
+    VSRI,
+    // Vector extract: `dst = (a : b) byte-shifted right by imm`. The byte offset rides in the last
+    // operand as an `Imm`; the element data type is always byte-granular for the operation itself.
+    VEXT,
+    // Vector convert between f32 and 32-bit integer (round toward zero for the float->int forms).
+    // The `dt` carries the integer element's signedness (`.s32`/`.u32`); the other side is f32.
+    VCVTFtoI, // f32 -> s32/u32
+    VCVTItoF, // s32/u32 -> f32
+    // Vector compares (`dst` lane = all-ones on true, zero on false), integer or f32. The integer
+    // forms carry signedness in `dt` for the ordered compares. VCLE/VCLT exist only as the
+    // compare-against-`#0` (two-registers-misc) forms; the register-register `a <= b`/`a < b` cases
+    // are assembled as VCGE/VCGT with the operands swapped. VACGE/VACGT compare absolute values
+    // (`|a| >= |b|`, `|a| > |b|`), f32 only.
+    VCEQ,
+    VCGT,
+    VCGE,
+    VCLE,
+    VCLT,
+    VACGE,
+    VACGT,
+    // Pairwise floating-point max/min (three registers, f32): adjacent element pairs within the
+    // concatenation of the two sources are reduced.
+    VPMAX,
+    VPMIN,
+    // Reverse the order of elements within each 16/32/64-bit container (two registers). The `.NN`
+    // suffix (in `dt`) names the element size being reversed; the container size is implied by the op.
+    VREV16,
+    VREV32,
+    VREV64,
+    // Saturating shift-left by a signed per-lane amount (the register form of `vshl`). The unsaturated
+    // register `vshl` reuses [`NeonOp::VSHL`]; the immediate shift forms live in the shift-amount class.
+    VQSHL,
+    // Reciprocal / reciprocal-square-root estimate (two registers, f32): a fast ~8-bit seed for
+    // Newton-Raphson division and inverse-square-root (`vrecpe`/`vrsqrte`).
+    VRECPE,
+    VRSQRTE,
+    // Newton-Raphson refinement steps that pair with the estimates (three registers, f32):
+    // `vrecps` computes `2.0 - a*b`, `vrsqrts` computes `(3.0 - a*b) / 2`.
+    VRECPS,
+    VRSQRTS,
+    // Two-register permutes. VTRN transposes adjacent element pairs across the two registers; VZIP
+    // interleaves and VUZP de-interleaves them; VSWP swaps them wholesale. All write BOTH operands.
+    VTRN,
+    VZIP,
+    VUZP,
+    VSWP,
+    // Bitwise test (three registers): `dst` lane = all-ones when `a AND b` is nonzero, else zero.
+    VTST,
+    // Narrowing move (two registers): each `2*esize`-bit element of the `Qm` source is truncated to
+    // its low `esize` bits and written to the `Dd` result.
+    VMOVN,
 }
 
 /// a VFP scalar data type, used to render the `.<ty>` suffixes of `vcvt`.
@@ -658,59 +778,132 @@ impl SIMDReg {
     }
 }
 
+/// how each register in a NEON structure/element load-store register list is addressed. the
+/// list itself is a run of doubleword registers (see [`Operand::SIMDRegPoints`]); this says
+/// whether the whole register participates or just one lane.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum SIMDElement {
+    /// the whole register, as in the "multiple structures" forms: `{d0, d1}`.
+    Whole,
+    /// a single lane of each register, as in "single element to one lane": `{d0[2], d1[2]}`.
+    Lane(u8),
+    /// every lane of each register (broadcast), as in "single element to all lanes": `{d0[], d1[]}`.
+    AllLanes,
+}
+
 /// decode the NEON structure load/store space (`1111 0100 ...`). currently handles the `vld1`/
 /// `vst1` (single structure to all/one, and multiple) contiguous "multiple" forms; the strided
 /// `vld2`/`vld3`/`vld4` and single-lane/all-lanes forms are deferred (`InvalidOpcode`).
 #[allow(non_snake_case)]
 pub(crate) fn decode_neon_loadstore(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let A = (word >> 23) & 1 != 0; // 0 -> multiple structures, 1 -> single element
     let D = ((word >> 22) & 1) as u8;
     let L = (word >> 21) & 1 != 0; // 1 -> load
-    let Rn = ((word >> 16) & 0b1111) as u8;
-    let Vd = ((word >> 12) & 0b1111) as u8;
-    let Rm = (word & 0b1111) as u8;
-
-    let single = (word >> 23) & 1 != 0;
-    if single {
-        // single-element (to-one-lane / to-all-lanes) forms are not yet decoded.
-        return Err(DecodeError::InvalidOpcode);
-    }
-    // the "multiple" forms require bit20 == 0; other values here are memory hints (pld/pli/...).
+    // bit20 is a fixed 0 in the load/store encodings; a 1 here is a memory hint (pld/pli/...).
     if (word >> 20) & 1 != 0 {
         return Err(DecodeError::Incomplete);
     }
-
-    // "multiple" forms: type field (bits 11:8) selects the structure kind and register count.
-    let ty = (word >> 8) & 0b1111;
-    let size = match (word >> 6) & 0b11 {
-        0 => 8u8,
-        1 => 16,
-        2 => 32,
-        _ => 64,
-    };
-    // only the contiguous vld1/vst1 forms (1-4 registers) are handled here.
-    let count = match ty {
-        0b0111 => 1u8,
-        0b1010 => 2,
-        0b0110 => 3,
-        0b0010 => 4,
-        _ => return Err(DecodeError::InvalidOpcode),
-    };
-
+    let Rn = ((word >> 16) & 0b1111) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Rm = (word & 0b1111) as u8;
     let first_num = (D << 4) | Vd;
-    // a list running past d31 is unpredictable; reject it (capstone renders a bogus register name).
-    if first_num as u16 + count as u16 > 32 {
+
+    // the outcome of decoding: N (structure size 1-4), the register-list shape, and the element size.
+    let (n, count, stride, element, esize, align);
+
+    if !A {
+        // ---- multiple n-element structures ----
+        // bits[11:8] = type -> (N, register count, register stride). bits[7:6] = element size.
+        let ty = (word >> 8) & 0b1111;
+        let (tn, tcount, tstride): (u8, u8, u8) = match ty {
+            0b0111 => (1, 1, 1),
+            0b1010 => (1, 2, 1),
+            0b0110 => (1, 3, 1),
+            0b0010 => (1, 4, 1),
+            0b1000 => (2, 2, 1),
+            0b1001 => (2, 2, 2),
+            0b0011 => (2, 4, 1),
+            0b0100 => (3, 3, 1),
+            0b0101 => (3, 3, 2),
+            0b0000 => (4, 4, 1),
+            0b0001 => (4, 4, 2),
+            _ => return Err(DecodeError::InvalidOpcode),
+        };
+        let sz = (word >> 6) & 0b11;
+        // element size 64-bit (0b11) is only defined for vld1/vst1.
+        if sz == 0b11 && tn != 1 {
+            return Err(DecodeError::InvalidOpcode);
+        }
+        n = tn;
+        count = tcount;
+        stride = tstride;
+        element = SIMDElement::Whole;
+        esize = match sz { 0 => 8u8, 1 => 16, 2 => 32, _ => 64 };
+        // alignment: aa (bits 5:4). 00 -> unaligned, else 64 << (aa-1).
+        align = match (word >> 4) & 0b11 { 0 => 0u16, 1 => 64, 2 => 128, _ => 256 };
+    } else {
+        // ---- single element ----
+        let sz2 = (word >> 10) & 0b11; // bits[11:10]
+        let ia = ((word >> 4) & 0b1111) as u8; // bits[7:4] index_align
+        n = ((word >> 8) & 0b11) as u8 + 1; // bits[9:8] = N-1
+        if sz2 == 0b11 {
+            // single element to ALL lanes: bits[7:6] = size, bit5 = T (spacing/second-reg),
+            // bit4 = a (align). size 0b11 is reserved except for vld4 (a special 32-bit form).
+            let sz = (word >> 6) & 0b11;
+            if sz == 0b11 && n != 4 {
+                return Err(DecodeError::InvalidOpcode);
+            }
+            // element size: the special vld4 size 0b11 is 32-bit; the rest map directly.
+            esize = match sz { 0 => 8u8, 1 => 16, _ => 32 };
+            let t = (word >> 5) & 1 != 0;
+            let a = (word >> 4) & 1 != 0;
+            element = SIMDElement::AllLanes;
+            if n == 1 {
+                // vld1 to all lanes: T selects one register or two (both broadcast), contiguous.
+                count = if t { 2 } else { 1 };
+                stride = 1;
+            } else {
+                // vld2/3/4 to all lanes: one register per structure element, T selects the spacing.
+                count = n;
+                stride = if t { 2 } else { 1 };
+            }
+            // alignment (when a is set), in bits, per the ARM ARM per-structure tables.
+            align = if !a && sz != 0b11 {
+                0
+            } else {
+                match n {
+                    1 => {
+                        if esize == 8 { return Err(DecodeError::InvalidOperand); }
+                        esize as u16 // vld1: align to the element
+                    }
+                    2 => 2 * esize as u16, // vld2: align to the 2-element structure
+                    3 => return Err(DecodeError::InvalidOperand), // vld3: no aligned form
+                    _ => match sz {
+                        // vld4: 8b->4B, 16b->8B, 32b->8B, and the special 0b11 32b form ->16B.
+                        0 => 32,
+                        1 => 64,
+                        2 => 64,
+                        _ => 128,
+                    },
+                }
+            };
+        } else {
+            // single element to ONE lane: index and alignment packed in index_align per size.
+            esize = match sz2 { 0 => 8u8, 1 => 16, 2 => 32, _ => unreachable!() };
+            let (idx, st, al) = neon_one_lane_index_align(esize, n, ia)?;
+            stride = st;
+            count = n;
+            element = SIMDElement::Lane(idx);
+            align = al;
+        }
+    }
+
+    // a register list running past d31 is unpredictable; reject it.
+    if count > 0 && first_num as u16 + (count as u16 - 1) * stride as u16 > 31 {
         return Err(DecodeError::InvalidOperand);
     }
     let first = SIMDReg::new(SIMDSizeCode::D, first_num);
-    let list = Operand::SIMDRegList(first, count);
-
-    // alignment: aa (bits 5:4). 00 -> unaligned, else 64 << (aa-1).
-    let align = match (word >> 4) & 0b11 {
-        0 => 0u16,
-        1 => 64,
-        2 => 128,
-        _ => 256,
-    };
+    let list = Operand::SIMDRegPoints { first, count, stride, element };
 
     // addressing mode from Rm: 15 -> plain, 13 -> writeback (`!`), else post-indexed by Rm.
     let deref = if Rm == 0b1111 {
@@ -721,10 +914,69 @@ pub(crate) fn decode_neon_loadstore(word: u32) -> Result<(Opcode, [Operand; 4]),
         Operand::SIMDDeref { base: Reg::from_u8(Rn), align, wback: false, post: Some(Reg::from_u8(Rm)) }
     };
 
-    let dt = SIMDDataType::Any(size);
-    let opcode = if L { Opcode::VLDN(1, dt) } else { Opcode::VSTN(1, dt) };
-    let _ = count;
+    let dt = SIMDDataType::Any(esize);
+    let opcode = if L { Opcode::VLDN(n, dt) } else { Opcode::VSTN(n, dt) };
     Ok((opcode, [list, deref, Operand::Nothing, Operand::Nothing]))
+}
+
+/// decode the `index_align` field (bits[7:4]) of a NEON "single element to one lane" load/store,
+/// given the element size in bits and the structure size `n` (1-4). returns `(lane index, register
+/// stride, alignment in bits)`, or a decode error for the `UNDEFINED` bit patterns. the rules are
+/// per the ARM ARM element/structure load/store index_align tables and differ by element size.
+fn neon_one_lane_index_align(esize: u8, n: u8, ia: u8) -> Result<(u8, u8, u16), DecodeError> {
+    let b = |k: u8| (ia >> k) & 1;
+    match esize {
+        8 => {
+            // index = ia[3:1]; 8-bit lanes are always single-spaced; ia[0] = alignment.
+            let index = ia >> 1;
+            let a = b(0);
+            let align = match n {
+                1 | 3 => {
+                    if a != 0 { return Err(DecodeError::InvalidOperand); }
+                    0
+                }
+                2 => if a == 1 { 16 } else { 0 },
+                _ => if a == 1 { 32 } else { 0 }, // n == 4
+            };
+            Ok((index, 1, align))
+        }
+        16 => {
+            // index = ia[3:2]; ia[1] = register spacing (T); ia[0] = alignment.
+            let index = ia >> 2;
+            let stride = if n == 1 { 1 } else if b(1) == 1 { 2 } else { 1 };
+            // for n == 1 the spacing bit ia[1] must be 0.
+            if n == 1 && b(1) != 0 { return Err(DecodeError::InvalidOperand); }
+            let a = b(0);
+            let align = match n {
+                1 => if a == 1 { 16 } else { 0 },
+                2 => if a == 1 { 32 } else { 0 },
+                3 => {
+                    if a != 0 { return Err(DecodeError::InvalidOperand); }
+                    0
+                }
+                _ => if a == 1 { 64 } else { 0 }, // n == 4
+            };
+            Ok((index, stride, align))
+        }
+        _ => {
+            // 32-bit: index = ia[3]; ia[2] = register spacing (T); ia[1:0] = alignment.
+            let index = ia >> 3;
+            let stride = if n == 1 { 1 } else if b(2) == 1 { 2 } else { 1 };
+            // for n == 1 the spacing bit ia[2] must be 0.
+            if n == 1 && b(2) != 0 { return Err(DecodeError::InvalidOperand); }
+            let aa = ia & 0b0011;
+            let align = match n {
+                1 => match aa { 0 => 0, 3 => 32, _ => return Err(DecodeError::InvalidOperand) },
+                2 => match aa { 0 => 0, 1 => 64, _ => return Err(DecodeError::InvalidOperand) },
+                3 => {
+                    if aa != 0 { return Err(DecodeError::InvalidOperand); }
+                    0
+                }
+                _ => match aa { 0 => 0, 1 => 64, 2 => 128, _ => return Err(DecodeError::InvalidOperand) }, // n == 4
+            };
+            Ok((index, stride, align))
+        }
+    }
 }
 
 /// ARM `VFPExpandImm(imm8, 32)`: expand a VFP `vmov.f32` 8-bit immediate to its f32 bit pattern.
@@ -815,25 +1067,688 @@ fn decode_neon_dp_1reg_imm(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeEr
     let imm4 = (word & 0b1111) as u8;
     let imm8 = (i << 7) | (imm3 << 4) | imm4;
 
-    // Only the VMOV-immediate (`op == 0`) form is lifted; the VMVN/VORR/VBIC-immediate (`op == 1`)
-    // forms are not needed by the cube and need their own opcodes, so defer them.
-    if op == 1 {
-        return Err(DecodeError::Incomplete);
-    }
-
     let dd_num = (D << 4) | Vd;
     let dest = if Q {
         Operand::SIMDReg(SIMDReg::new(SIMDSizeCode::Q, dd_num >> 1))
     } else {
         Operand::SIMDReg(SIMDReg::new(SIMDSizeCode::D, dd_num))
     };
-
-    // The expanded 64-bit lane value is returned as two `Imm` operands (low, high) so the caller
-    // gets the whole doubleword pattern regardless of element size.
     let value = adv_simd_expand_imm(op, cmode, imm8);
+
+    // `vmov.f32 #imm` (cmode == 0b1111, op == 0): the expanded value is the 32-bit float bit pattern.
+    // Emitted as a 32-bit broadcast of that pattern (a broadcast of the f32 bits is exactly the
+    // f32x4 constant), so the integer `vmovi` lowering already produces the right vector.
+    if op == 0 && cmode == 0b1111 {
+        return Ok((
+            Opcode::Neon { op: NeonOp::VMOVI, dt: SIMDDataType::Float(32) },
+            [dest, Operand::Imm(value as u32), Operand::Nothing, Operand::Nothing],
+        ));
+    }
+
+    // The broadcast element size for the shifted-byte / byte-with-ones cmodes.
+    let esize: u8 = match cmode {
+        0b0000 | 0b0010 | 0b0100 | 0b0110 | 0b1100 | 0b1101 => 32,
+        0b1000 | 0b1010 => 16,
+        0b1110 if op == 0 => 8, // op == 0, cmode 1110: vmov.i8
+        _ => 0,                 // op == 1 cmode 1110 = vmov.i64; cmode[0] == 1 = vorr/vbic; handled below
+    };
+
+    if op == 0 {
+        // `vmov.iN` broadcast: the per-element value is the low `esize` bits (32-bit needs no mask).
+        if esize == 0 {
+            return Err(DecodeError::Incomplete); // vorr immediate (cmode[0] == 1) not decoded yet
+        }
+        let per = if esize == 32 { value as u32 } else { (value as u32) & ((1u32 << esize) - 1) };
+        return Ok((
+            Opcode::Neon { op: NeonOp::VMOVI, dt: SIMDDataType::Int(esize) },
+            [dest, Operand::Imm(per), Operand::Nothing, Operand::Nothing],
+        ));
+    }
+
+    // op == 1. `vmvn.iN #imm` produces the same vector as `vmov.iN #!imm`, so fold it into the
+    // integer broadcast with the inverted value (transpiler-equivalent). `vmov.i64` (cmode 1110) is a
+    // genuine 64-bit-per-lane pattern (each imm8 bit fills a byte with 0x00/0xff) that no smaller
+    // broadcast reproduces, so it carries the whole 64-bit value as low/high immediates. The `vbic`
+    // immediate-accumulate forms (cmode[0] == 1) are not decoded yet.
+    if cmode == 0b1110 {
+        return Ok((
+            Opcode::Neon { op: NeonOp::VMOVI, dt: SIMDDataType::Int(64) },
+            [dest, Operand::Imm(value as u32), Operand::Imm((value >> 32) as u32), Operand::Nothing],
+        ));
+    }
+    if cmode & 1 == 1 {
+        return Err(DecodeError::Incomplete);
+    }
+    let per = if esize == 32 { (!value) as u32 } else { ((!value) as u32) & ((1u32 << esize) - 1) };
     Ok((
-        Opcode::VMOV,
-        [dest, Operand::Imm(value as u32), Operand::Imm((value >> 32) as u32), Operand::Nothing],
+        Opcode::Neon { op: NeonOp::VMOVI, dt: SIMDDataType::Int(esize) },
+        [dest, Operand::Imm(per), Operand::Nothing, Operand::Nothing],
+    ))
+}
+
+/// build an Advanced-SIMD register operand that is a `Q` (quad, `q == true`) or `D` (double). the
+/// caller passes the raw doubleword number (`(D << 4) | Vd`); a `Q` register is that number halved.
+#[inline]
+fn simd_qd(q: bool, dnum: u8) -> Operand {
+    if q {
+        Operand::SIMDReg(SIMDReg::new(SIMDSizeCode::Q, dnum >> 1))
+    } else {
+        Operand::SIMDReg(SIMDReg::new(SIMDSizeCode::D, dnum))
+    }
+}
+
+/// a `D`-register operand from a raw doubleword number.
+#[inline]
+fn simd_d(dnum: u8) -> Operand {
+    Operand::SIMDReg(SIMDReg::new(SIMDSizeCode::D, dnum))
+}
+
+/// a `Q`-register operand from a raw doubleword number (halved to the quad number).
+#[inline]
+fn simd_q(dnum: u8) -> Operand {
+    Operand::SIMDReg(SIMDReg::new(SIMDSizeCode::Q, dnum >> 1))
+}
+
+/// decode the Advanced-SIMD (NEON) data-processing space (`1111 001x ...` in A32; the shared
+/// bits[23:0] of the Thumb form route here too). the space is a flat set of encoding classes
+/// selected by bit23 (`A`), bit4 (`C`) and the sub-fields; this decodes the integer add/widen/
+/// pairwise/abs-diff family that gcc's auto-vectorizer emits, returning [`DecodeError::Incomplete`]
+/// for the (many) encodings outside that set so the differential oracle reports them as decoder gaps
+/// rather than mismatches. `word` is the full A32-form 32-bit instruction.
+#[allow(non_snake_case)]
+fn decode_neon_dataproc(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let A = (word >> 23) & 1;
+    let bit4 = (word >> 4) & 1;
+
+    // one register and modified immediate (`vmov`/`vmvn`/`vorr`/`vbic` imm): A == 1, bits[21:19] ==
+    // 0, bit7 == 0, bit4 == 1. handled by its own decoder (the `comes_first` case in dynarmic).
+    if A == 1 && (word >> 19) & 0b111 == 0 && (word >> 7) & 1 == 0 && bit4 == 1 {
+        return decode_neon_dp_1reg_imm(word);
+    }
+
+    if A == 0 {
+        return decode_neon_3same(word);
+    }
+    // A == 1.
+    if bit4 == 1 {
+        return decode_neon_2shift(word);
+    }
+    // A == 1, bit4 == 0.
+    if (word >> 20) & 0b11 == 0b11 {
+        // bits[21:20] == 11. `U == 0` is VEXT (the only instruction there); `U == 1` is the
+        // two-registers-misc family plus VDUP-scalar and VTBL/VTBX.
+        if (word >> 24) & 1 == 0 {
+            return decode_neon_vext(word);
+        }
+        return decode_neon_2misc(word);
+    }
+    if (word >> 6) & 1 == 0 {
+        // bit6 == 0: three registers of different lengths (long / wide).
+        return decode_neon_3diff(word);
+    }
+    // bit6 == 1: two registers and a scalar.
+    decode_neon_2reg_scalar(word)
+}
+
+/// two-registers-and-a-scalar subset: the multiply / multiply-accumulate forms where the second
+/// factor is a single broadcast lane `Dm[index]` (`vmul`/`vmla`/`vmls` by scalar). `bits[11:8]`
+/// select the operation: `{op2,op1,op0,F}` where `op2:op1:op0` picks VMLA(000)/VMLS(010)/VMUL(100)
+/// and `F` (bit8) selects the f32 form over the integer one. The scalar's register and lane index
+/// come from `Vm`/`M` per the element size (32-bit: `Dm = Vm`, index `M`; 16-bit: `Dm = Vm[2:0]`,
+/// index `M:Vm[3]`). The widening (`vmlal`/`vmull`) and saturating-doubling (`vqdmulh`/`vqrdmulh`/
+/// `vqdmull`) by-scalar forms are not decoded yet.
+#[allow(non_snake_case)]
+fn decode_neon_2reg_scalar(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let Q = (word >> 24) & 1 != 0;
+    let size = (word >> 20) & 0b11;
+    let op = (word >> 8) & 0b1111;
+
+    let D = ((word >> 22) & 1) as u8;
+    let N = ((word >> 7) & 1) as u8;
+    let M = (word >> 5) & 1;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vn = ((word >> 16) & 0b1111) as u8;
+    let Vm = word & 0b1111;
+    let dnum = (D << 4) | Vd;
+    let nnum = (N << 4) | Vn;
+
+    // The multiply/accumulate forms select the operation from bits[11:9] and float from bit8.
+    let (neon_op, float) = match op {
+        0b0000 => (NeonOp::VMLA, false),
+        0b0001 => (NeonOp::VMLA, true),
+        0b0100 => (NeonOp::VMLS, false),
+        0b0101 => (NeonOp::VMLS, true),
+        0b1000 => (NeonOp::VMUL, false),
+        0b1001 => (NeonOp::VMUL, true),
+        _ => return Err(DecodeError::Incomplete),
+    };
+
+    // The scalar's register/lane packing depends on the element size (bits[21:20]); only 16-bit and
+    // 32-bit scalars exist (an 8-bit or 64-bit `size` is unallocated here). The float forms are f32
+    // only - the 16-bit float form is the out-of-scope f16 (no half-precision arithmetic on the A9).
+    if float && size != 0b10 {
+        return Err(DecodeError::Incomplete);
+    }
+    let (esize, mnum, index): (u8, u8, u8) = match size {
+        0b01 => (16, (Vm & 0b0111) as u8, (((M << 1) | (Vm >> 3)) & 0b11) as u8),
+        0b10 => (32, Vm as u8, M as u8),
+        _ => return Err(DecodeError::InvalidOpcode),
+    };
+
+    let dt = if float { SIMDDataType::Float(esize) } else { SIMDDataType::Int(esize) };
+    Ok((
+        Opcode::Neon { op: neon_op, dt },
+        [
+            simd_qd(Q, dnum),
+            simd_qd(Q, nnum),
+            Operand::SIMDRegLane(SIMDReg::new(SIMDSizeCode::D, mnum), index),
+            Operand::Nothing,
+        ],
+    ))
+}
+
+/// element size in bits from the two-bit `size` field (bits[21:20]).
+#[inline]
+fn neon_esize(size: u32) -> u8 {
+    (8u16 << size) as u8
+}
+
+/// three-registers-of-the-same-length subset. Integer forms (VADD/VSUB/VMUL/VMLA/VMLS/VMAX/VMIN/
+/// VPADD/VABD) plus the floating-point forms (B == 1101/1110/1111), which 3D code leans on heavily.
+/// For the float forms bits[21:20] are `{op-variant, F32(0)/F16(1)}`, not an integer element size.
+#[allow(non_snake_case)]
+fn decode_neon_3same(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let U = (word >> 24) & 1;
+    let size = (word >> 20) & 0b11;
+    let B = (word >> 8) & 0b1111;
+    let bit4 = (word >> 4) & 1;
+    let Q = (word >> 6) & 1 != 0;
+
+    let D = ((word >> 22) & 1) as u8;
+    let N = ((word >> 7) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vn = ((word >> 16) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    let dnum = (D << 4) | Vd;
+    let nnum = (N << 4) | Vn;
+    let mnum = (M << 4) | Vm;
+
+    let esize = neon_esize(size);
+    let signed = || if U == 1 { SIMDDataType::Unsigned(esize) } else { SIMDDataType::Signed(esize) };
+
+    // Floating-point same-length forms: bits[11:8] are 1101 (VADD/VSUB/VMUL/VMLA/VMLS/VPADD/VABD),
+    // 1110 (compare, not decoded), or 1111 (VMAX/VMIN/VRECPS/VRSQRTS). Here bit21 selects the
+    // op variant and bit20 selects F32 (0) or F16 (1). `sz2 = bit21`.
+    if matches!(B, 0b1101 | 0b1111) {
+        let fsize = if size & 1 == 0 { 32 } else { 16 };
+        let ft = SIMDDataType::Float(fsize);
+        let sz2 = size & 0b10 != 0; // the operation-select bit (bit21)
+        let fop = match (B, bit4, U, sz2) {
+            (0b1101, 0, 0, false) => Some(NeonOp::VADD),
+            (0b1101, 0, 0, true) => Some(NeonOp::VSUB),
+            (0b1101, 1, 0, false) => Some(NeonOp::VMLA),
+            (0b1101, 1, 0, true) => Some(NeonOp::VMLS),
+            (0b1101, 1, 1, false) => Some(NeonOp::VMUL),
+            (0b1101, 0, 1, false) if !Q => Some(NeonOp::VPADD),
+            (0b1101, 0, 1, true) => Some(NeonOp::VABD),
+            (0b1111, 0, 0, false) => Some(NeonOp::VMAX),
+            (0b1111, 0, 0, true) => Some(NeonOp::VMIN),
+            // Pairwise max/min (U == 1, bit4 == 0). Like the integer VPADD these are doubleword-only;
+            // the Q form is unallocated.
+            (0b1111, 0, 1, false) if !Q => Some(NeonOp::VPMAX),
+            (0b1111, 0, 1, true) if !Q => Some(NeonOp::VPMIN),
+            // The Newton-Raphson refinement steps (bit4 == 1, U == 0): VRECPS (bit21 == 0) and
+            // VRSQRTS (bit21 == 1). Both are f32.
+            (0b1111, 1, 0, false) => Some(NeonOp::VRECPS),
+            (0b1111, 1, 0, true) => Some(NeonOp::VRSQRTS),
+            _ => None,
+        };
+        if let Some(op) = fop {
+            return Ok((
+                Opcode::Neon { op, dt: ft },
+                [simd_qd(Q, dnum), simd_qd(Q, nnum), simd_qd(Q, mnum), Operand::Nothing],
+            ));
+        }
+    }
+
+    // Floating-point compares occupy bits[11:8] == 1110. bit4 splits the ordered compares (bit4 == 0)
+    // from the absolute-value compares (bit4 == 1); U and bit21 (`sz2`) then pick the relation:
+    // `vceq.f32` (U == 0, sz2 == 0), `vcge.f32` (U == 1, sz2 == 0), `vcgt.f32` (U == 1, sz2 == 1),
+    // and the absolute forms `vacge.f32` (bit4 == 1, sz2 == 0) / `vacgt.f32` (bit4 == 1, sz2 == 1).
+    if B == 0b1110 {
+        let fsize = if size & 1 == 0 { 32 } else { 16 };
+        let ft = SIMDDataType::Float(fsize);
+        let sz2 = size & 0b10 != 0;
+        let fop = match (bit4, U, sz2) {
+            (0, 0, false) => Some(NeonOp::VCEQ),
+            (0, 1, false) => Some(NeonOp::VCGE),
+            (0, 1, true) => Some(NeonOp::VCGT),
+            (1, 1, false) => Some(NeonOp::VACGE),
+            (1, 1, true) => Some(NeonOp::VACGT),
+            _ => None,
+        };
+        if let Some(op) = fop {
+            return Ok((
+                Opcode::Neon { op, dt: ft },
+                [simd_qd(Q, dnum), simd_qd(Q, nnum), simd_qd(Q, mnum), Operand::Nothing],
+            ));
+        }
+    }
+
+    // Shift-left by a signed per-lane amount, register form (bits[11:8] == 0100): VSHL (bit4 == 0)
+    // and the saturating VQSHL (bit4 == 1); signedness comes from U. The shift-amount register is Vn
+    // and the shifted value is Vm, so the assembly operand order is `Vd, Vm, Vn` (Vm and Vn swapped
+    // relative to the usual three-register layout).
+    if B == 0b0100 {
+        let op = if bit4 == 0 { NeonOp::VSHL } else { NeonOp::VQSHL };
+        return Ok((
+            Opcode::Neon { op, dt: signed() },
+            [simd_qd(Q, dnum), simd_qd(Q, mnum), simd_qd(Q, nnum), Operand::Nothing],
+        ));
+    }
+
+    let (op, dt) = match (B, bit4) {
+        // Integer compares: `vcgt`/`vcge` (bits[11:8] == 0011, signedness from U), and `vceq`
+        // (bits[11:8] == 1000, bit4 == 1, U == 1 - U == 0 there is `vtst`, not decoded yet).
+        (0b0011, 0) => (NeonOp::VCGT, signed()),
+        (0b0011, 1) => (NeonOp::VCGE, signed()),
+        (0b1000, 1) if U == 1 => (NeonOp::VCEQ, SIMDDataType::Int(esize)),
+        // VTST (bits[11:8] == 1000, bit4 == 1, U == 0): `(a AND b) != 0` per lane. The suffix is a
+        // plain element size (`.8`/`.16`/`.32`).
+        (0b1000, 1) => (NeonOp::VTST, SIMDDataType::Any(esize)),
+        (0b1000, 0) => (if U == 0 { NeonOp::VADD } else { NeonOp::VSUB }, SIMDDataType::Int(esize)),
+        (0b1001, 0) => (if U == 0 { NeonOp::VMLA } else { NeonOp::VMLS }, SIMDDataType::Int(esize)),
+        // integer VMUL (`U`/`P` == 0); the polynomial form (`P == 1`) is not decoded.
+        (0b1001, 1) if U == 0 => (NeonOp::VMUL, SIMDDataType::Int(esize)),
+        (0b0110, 0) => (NeonOp::VMAX, signed()),
+        (0b0110, 1) => (NeonOp::VMIN, signed()),
+        (0b0111, 0) => (NeonOp::VABD, signed()),
+        // VPADD is 64-bit only (operates on D registers); the Q form is unallocated.
+        (0b1011, 1) if U == 0 && !Q => (NeonOp::VPADD, SIMDDataType::Int(esize)),
+        // Bitwise logical family: `U` and `size` (bits[21:20]) pick the operation;
+        // it is element-size agnostic, so the data type is a placeholder.
+        (0b0001, 1) => {
+            let op = match (U, size) {
+                (0, 0b00) => NeonOp::VAND,
+                (0, 0b01) => NeonOp::VBIC,
+                (0, 0b10) => NeonOp::VORR,
+                (0, 0b11) => NeonOp::VORN,
+                (_, 0b00) => NeonOp::VEOR,
+                (_, 0b01) => NeonOp::VBSL,
+                (_, 0b10) => NeonOp::VBIT,
+                (_, _) => NeonOp::VBIF,
+            };
+            (op, SIMDDataType::Any(8))
+        }
+        _ => return Err(DecodeError::Incomplete),
+    };
+
+    Ok((
+        Opcode::Neon { op, dt },
+        [simd_qd(Q, dnum), simd_qd(Q, nnum), simd_qd(Q, mnum), Operand::Nothing],
+    ))
+}
+
+/// three-registers-of-different-lengths (widening) subset: VADDL/VADDW/VSUBL/VSUBW/VABAL/VABDL/
+/// VMLAL/VMLSL/VMULL. the destination is always a `Q`; long forms take two `D` sources, the wide
+/// forms (VADDW/VSUBW) take a `Q` and a `D`.
+#[allow(non_snake_case)]
+fn decode_neon_3diff(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let U = (word >> 24) & 1;
+    let size = (word >> 20) & 0b11;
+    let B = (word >> 8) & 0b1111;
+
+    let D = ((word >> 22) & 1) as u8;
+    let N = ((word >> 7) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vn = ((word >> 16) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    let dnum = (D << 4) | Vd;
+    let nnum = (N << 4) | Vn;
+    let mnum = (M << 4) | Vm;
+
+    // the suffix names the (narrow) source element size.
+    let esize = neon_esize(size);
+    let signed = if U == 1 { SIMDDataType::Unsigned(esize) } else { SIMDDataType::Signed(esize) };
+
+    // `wide` forms (VADDW/VSUBW) take a Q first source; every other form is `long` (two D sources).
+    let (op, wide) = match B {
+        0b0000 => (NeonOp::VADDL, false),
+        0b0001 => (NeonOp::VADDW, true),
+        0b0010 => (NeonOp::VSUBL, false),
+        0b0011 => (NeonOp::VSUBW, true),
+        0b0101 => (NeonOp::VABAL, false),
+        0b0111 => (NeonOp::VABDL, false),
+        0b1000 => (NeonOp::VMLAL, false),
+        0b1010 => (NeonOp::VMLSL, false),
+        // integer VMULL (`P` == bit9 == 0); the polynomial form is not decoded.
+        0b1100 => (NeonOp::VMULL, false),
+        _ => return Err(DecodeError::Incomplete),
+    };
+
+    let src1 = if wide { simd_q(nnum) } else { simd_d(nnum) };
+    Ok((
+        Opcode::Neon { op, dt: signed },
+        [simd_q(dnum), src1, simd_d(mnum), Operand::Nothing],
+    ))
+}
+
+/// two-registers-miscellaneous subset: VPADDL/VPADAL (pairwise-add[-accumulate]-long) and the
+/// integer/float VABS/VNEG. selected by bits[17:16] (`B`) and bits[11:6].
+#[allow(non_snake_case)]
+fn decode_neon_2misc(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    // VDUP (scalar): broadcast one lane of `Dm` across `Qd`/`Dd`. It shares the
+    // bits[21:20] == 11 space but is distinguished by bits[11:8] == 1100, bit7 == 0
+    // (its element size and lane index live in imm4 = bits[19:16], not the 2misc
+    // size/B fields), so it must be split off before the generic 2misc field decode.
+    if (word >> 8) & 0b1111 == 0b1100 && (word >> 7) & 1 == 0 {
+        return decode_neon_vdup_scalar(word);
+    }
+    // two-registers-misc is the `U == 1` (bit24 == 1) half of the bits[21:20] == 11 space.
+    if (word >> 24) & 1 == 0 {
+        return Err(DecodeError::Incomplete);
+    }
+    let size = (word >> 18) & 0b11; // bits[19:18]
+    let B = (word >> 16) & 0b11; // bits[17:16]
+    let sub = (word >> 7) & 0b1_1111; // bits[11:7]
+    let Q = (word >> 6) & 1 != 0;
+
+    let D = ((word >> 22) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    let dnum = (D << 4) | Vd;
+    let mnum = (M << 4) | Vm;
+    let esize = neon_esize(size);
+
+    // `sub` is bits[11:7]. For VABS/VNEG the layout is `0 F 1 1 op`: bit10 = F (0 -> signed integer,
+    // 1 -> float), bit7 = op (0 -> VABS, 1 -> VNEG). The Cortex-A9 has no half-precision arithmetic,
+    // so the float form is only valid at size 32 (`.f32`); float size 8/16 is left undecoded (it is
+    // the not-in-scope f16, which capstone still renders).
+    let float_ok = esize == 32;
+
+    // Compare-against-`#0` group (bits[17:16] == 01, bit11 == 0): `op` = bits[9:7] picks the relation,
+    // `F` = bit10 picks float over integer. These render with an explicit `#0` third operand, so they
+    // return here rather than through the two-register tail below. VCGT/VCGE/VCLE/VCLT carry
+    // signedness (compare of a signed value against zero); VCEQ is signedness-agnostic (`.iNN`). The
+    // float forms are `.f32` only. `op` in {101,110,111} falls through to VABS/VNEG in the tail.
+    if B == 0b01 && (sub >> 4) == 0 {
+        let op3 = sub & 0b111;
+        let is_float = (sub >> 3) & 1 != 0;
+        let cmp = match op3 {
+            0b000 => Some(NeonOp::VCGT),
+            0b001 => Some(NeonOp::VCGE),
+            0b010 => Some(NeonOp::VCEQ),
+            0b011 => Some(NeonOp::VCLE),
+            0b100 => Some(NeonOp::VCLT),
+            _ => None,
+        };
+        if let Some(op) = cmp {
+            let dt = if is_float {
+                if !float_ok {
+                    return Err(DecodeError::Incomplete);
+                }
+                SIMDDataType::Float(32)
+            } else if esize == 64 {
+                // integer compare-against-zero is undefined for 64-bit elements.
+                return Err(DecodeError::Incomplete);
+            } else if op == NeonOp::VCEQ {
+                SIMDDataType::Int(esize)
+            } else {
+                SIMDDataType::Signed(esize)
+            };
+            return Ok((
+                Opcode::Neon { op, dt },
+                [simd_qd(Q, dnum), simd_qd(Q, mnum), Operand::Imm(0), Operand::Nothing],
+            ));
+        }
+    }
+
+    // VMOVN (bits[17:16] == 10, bits[11:7] == 00100, bit6 == 0): narrow each `2*esize`-bit element
+    // of the `Qm` source into the `Dd` result. The suffix names the source element (twice `esize`);
+    // size 11 (a 128-bit source element) is undefined.
+    if B == 0b10 && sub == 0b0_0100 && !Q && esize != 64 {
+        return Ok((
+            Opcode::Neon { op: NeonOp::VMOVN, dt: SIMDDataType::Int(2 * esize) },
+            [simd_d(dnum), simd_q(mnum), Operand::Nothing, Operand::Nothing],
+        ));
+    }
+
+    let (op, dt) = match (B, sub) {
+        // VREVn: reverse element order within each 16/32/64-bit container (bits[17:16] == 00,
+        // bits[11:7] == 000:op with op = bits[8:7]). The `.NN` suffix names the element size, which
+        // must be strictly smaller than the container the op reverses.
+        (0b00, 0b0_0000) if esize != 64 => (NeonOp::VREV64, SIMDDataType::Any(esize)),
+        (0b00, 0b0_0001) if esize == 8 || esize == 16 => (NeonOp::VREV32, SIMDDataType::Any(esize)),
+        (0b00, 0b0_0010) if esize == 8 => (NeonOp::VREV16, SIMDDataType::Any(esize)),
+        // VPADDL: bits[11:8] == 0010, bit7 == op (0 -> signed, 1 -> unsigned).
+        (0b00, 0b0_0100) => (NeonOp::VPADDL, SIMDDataType::Signed(esize)),
+        (0b00, 0b0_0101) => (NeonOp::VPADDL, SIMDDataType::Unsigned(esize)),
+        // VPADAL: bits[11:8] == 0110, bit7 == op.
+        (0b00, 0b0_1100) => (NeonOp::VPADAL, SIMDDataType::Signed(esize)),
+        (0b00, 0b0_1101) => (NeonOp::VPADAL, SIMDDataType::Unsigned(esize)),
+        // VABS integer / float; VNEG integer / float.
+        (0b01, 0b0_0110) => (NeonOp::VABS, SIMDDataType::Signed(esize)),
+        (0b01, 0b0_1110) if float_ok => (NeonOp::VABS, SIMDDataType::Float(esize)),
+        (0b01, 0b0_0111) => (NeonOp::VNEG, SIMDDataType::Signed(esize)),
+        (0b01, 0b0_1111) if float_ok => (NeonOp::VNEG, SIMDDataType::Float(esize)),
+        // VCVT (fp <-> int), bits[17:16] == 11, bits[11:9] == 011, `op` == bits[8:7]:
+        // 00/01 -> int->f32 (signed/unsigned), 10/11 -> f32->int (signed/unsigned). f32 only.
+        (0b11, 0b0_1100) if float_ok => (NeonOp::VCVTItoF, SIMDDataType::Signed(esize)),
+        (0b11, 0b0_1101) if float_ok => (NeonOp::VCVTItoF, SIMDDataType::Unsigned(esize)),
+        (0b11, 0b0_1110) if float_ok => (NeonOp::VCVTFtoI, SIMDDataType::Signed(esize)),
+        (0b11, 0b0_1111) if float_ok => (NeonOp::VCVTFtoI, SIMDDataType::Unsigned(esize)),
+        // Reciprocal / reciprocal-sqrt estimate (bits[17:16] == 11, bits[11:9] == 010): bit7 picks
+        // VRECPE (0) / VRSQRTE (1), bit8 (F) picks the f32 form over the u32 integer form. f32 only
+        // on the A9 (the u32 forms are defined but unused; decoded for completeness).
+        (0b11, 0b0_1000) if float_ok => (NeonOp::VRECPE, SIMDDataType::Unsigned(esize)),
+        (0b11, 0b0_1010) if float_ok => (NeonOp::VRECPE, SIMDDataType::Float(esize)),
+        (0b11, 0b0_1001) if float_ok => (NeonOp::VRSQRTE, SIMDDataType::Unsigned(esize)),
+        (0b11, 0b0_1011) if float_ok => (NeonOp::VRSQRTE, SIMDDataType::Float(esize)),
+        // Two-register permutes (bits[17:16] == 10): VTRN (bits[11:7] == 00001), VUZP (00010),
+        // VZIP (00011). Element size 8/16/32 from bits[19:18]; size 64 is undefined. (VSWP,
+        // bits[11:7] == 00000, renders without a data-type suffix and is not decoded yet.)
+        (0b10, 0b0_0001) if esize != 64 => (NeonOp::VTRN, SIMDDataType::Any(esize)),
+        (0b10, 0b0_0010) if esize != 64 => (NeonOp::VUZP, SIMDDataType::Any(esize)),
+        (0b10, 0b0_0011) if esize != 64 => (NeonOp::VZIP, SIMDDataType::Any(esize)),
+        _ => return Err(DecodeError::Incomplete),
+    };
+
+    Ok((
+        Opcode::Neon { op, dt },
+        [simd_qd(Q, dnum), simd_qd(Q, mnum), Operand::Nothing, Operand::Nothing],
+    ))
+}
+
+/// VDUP (scalar): `vdup.<size> Qd/Dd, Dm[index]` - broadcast one element of `Dm` across every lane
+/// of the destination. The element size and lane index are packed into `imm4` (bits[19:16]): the
+/// lowest set bit picks the size (8/16/32) and the bits above it are the index.
+#[allow(non_snake_case)]
+fn decode_neon_vdup_scalar(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let imm4 = ((word >> 16) & 0b1111) as u8;
+    let (esize, index): (u8, u8) = if imm4 & 0b0001 != 0 {
+        (8, imm4 >> 1)
+    } else if imm4 & 0b0011 == 0b0010 {
+        (16, imm4 >> 2)
+    } else if imm4 & 0b0111 == 0b0100 {
+        (32, imm4 >> 3)
+    } else {
+        return Err(DecodeError::InvalidOpcode); // imm4 == 0b?000: no size selected
+    };
+    let Q = (word >> 6) & 1 != 0;
+    let D = ((word >> 22) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    let dnum = (D << 4) | Vd;
+    let mnum = (M << 4) | Vm;
+    Ok((
+        Opcode::VDUP(SIMDDataType::Any(esize)),
+        [
+            simd_qd(Q, dnum),
+            Operand::SIMDRegLane(SIMDReg::new(SIMDSizeCode::D, mnum), index),
+            Operand::Nothing,
+            Operand::Nothing,
+        ],
+    ))
+}
+
+/// VEXT: `vext.8 Qd/Dd, Qn/Dn, Qm/Dm, #imm` - the destination is the `imm`-byte window into the
+/// concatenation `Qn:Qm` (low bytes from `Qn` starting at byte `imm`, wrapping into `Qm`). The
+/// operation is byte-granular; `imm` (the byte offset) rides in the last operand.
+#[allow(non_snake_case)]
+fn decode_neon_vext(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    if (word >> 4) & 1 != 0 {
+        return Err(DecodeError::InvalidOpcode); // bit4 must be 0 for VEXT
+    }
+    let imm4 = ((word >> 8) & 0b1111) as u8;
+    let Q = (word >> 6) & 1 != 0;
+    if !Q && imm4 >= 8 {
+        return Err(DecodeError::InvalidOpcode); // d-form byte offset must be < 8
+    }
+    let D = ((word >> 22) & 1) as u8;
+    let N = ((word >> 7) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vn = ((word >> 16) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    let dnum = (D << 4) | Vd;
+    let nnum = (N << 4) | Vn;
+    let mnum = (M << 4) | Vm;
+    // The operation is byte-granular, but capstone renders it at the largest element size that
+    // evenly divides the byte offset, with the immediate expressed in those elements (`vext.64 #1`
+    // for an 8-byte shift). Match that; the transpiler multiplies the immediate back out by the
+    // element byte-width to recover the byte offset.
+    let (esize, elem_imm): (u8, u32) = if imm4 % 8 == 0 {
+        (64, (imm4 / 8) as u32)
+    } else if imm4 % 4 == 0 {
+        (32, (imm4 / 4) as u32)
+    } else if imm4 % 2 == 0 {
+        (16, (imm4 / 2) as u32)
+    } else {
+        (8, imm4 as u32)
+    };
+    Ok((
+        Opcode::Neon { op: NeonOp::VEXT, dt: SIMDDataType::Any(esize) },
+        [simd_qd(Q, dnum), simd_qd(Q, nnum), simd_qd(Q, mnum), Operand::Imm(elem_imm)],
+    ))
+}
+
+/// two-registers-and-a-shift-amount subset: the widening move `vmovl` (`vshll` with a shift equal to
+/// the element size) plus the immediate shift-by-N forms `vshr`/`vsra`/`vshl`/`vsli`/`vsri`. The
+/// element size comes from `L:immh` (bits[7]:[21:19]); the shift amount is derived from `imm6`
+/// (bits[21:16]) and rides in the last operand. Rounding/saturating/narrowing shifts and the
+/// integer-to-float `vcvt` shifts are not decoded yet.
+#[allow(non_snake_case)]
+fn decode_neon_2shift(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let U = (word >> 24) & 1;
+    let B = (word >> 8) & 0b1111;
+    // The immediate shift-by-N forms (opc = bits[11:8] in {0000,0001,0100,0101}) share this class
+    // with `vmovl`. Element size and shift come from `L:immh` and `imm6`.
+    if matches!(B, 0b0000 | 0b0001 | 0b0100 | 0b0101) {
+        return decode_neon_shift_imm(word);
+    }
+    // `vmovl`/`vshll` occupy bits[11:8] == 1010 with bits[7:6] == 00.
+    if B != 0b1010 || (word >> 6) & 0b11 != 0 {
+        return Err(DecodeError::Incomplete);
+    }
+    // `vmovl` is the bits[18:16] == 0 case; imm3 == bits[21:19] selects the (power-of-two) element
+    // size 8/16/32. anything else is a genuine `vshll #n`, not decoded here.
+    if (word >> 16) & 0b111 != 0 {
+        return Err(DecodeError::Incomplete);
+    }
+    let imm3 = (word >> 19) & 0b111;
+    let esize: u8 = match imm3 {
+        0b001 => 8,
+        0b010 => 16,
+        0b100 => 32,
+        _ => return Err(DecodeError::Incomplete),
+    };
+    let dt = if U == 1 { SIMDDataType::Unsigned(esize) } else { SIMDDataType::Signed(esize) };
+
+    let D = ((word >> 22) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    let dnum = (D << 4) | Vd;
+    let mnum = (M << 4) | Vm;
+
+    Ok((
+        Opcode::Neon { op: NeonOp::VMOVL, dt },
+        [simd_q(dnum), simd_d(mnum), Operand::Nothing, Operand::Nothing],
+    ))
+}
+
+/// decode an immediate shift-by-N NEON instruction (`vshr`/`vsra`/`vshl`/`vsli`/`vsri`). The element
+/// size is `8/16/32/64` from `L:immh` (bit7 : bits[21:19]); the shift amount comes from `imm6` (bits
+/// [21:16]): a left shift (`vshl`/`vsli`) is `imm6 - esize` (or `imm6` at 64-bit), a right shift is
+/// `2*esize - imm6` (or `64 - imm6` at 64-bit). `Q` (bit6) selects the quad or double form.
+#[allow(non_snake_case)]
+fn decode_neon_shift_imm(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let U = (word >> 24) & 1;
+    let opc = (word >> 8) & 0b1111;
+    let L = (word >> 7) & 1;
+    let Q = (word >> 6) & 1 != 0;
+    let imm6 = (word >> 16) & 0b11_1111;
+    let immh = imm6 >> 3; // bits[21:19]
+
+    // esize from L:immh. L==0, immh==000 is the modified-immediate class (routed elsewhere); it
+    // should not reach here, but guard defensively.
+    let esize: u32 = if L == 1 {
+        64
+    } else if immh & 0b100 != 0 {
+        32
+    } else if immh & 0b010 != 0 {
+        16
+    } else if immh & 0b001 != 0 {
+        8
+    } else {
+        return Err(DecodeError::Incomplete);
+    };
+
+    let (op, is_left) = match (opc, U) {
+        (0b0000, _) => (NeonOp::VSHR, false),
+        (0b0001, _) => (NeonOp::VSRA, false),
+        (0b0101, 0) => (NeonOp::VSHL, true),
+        (0b0101, 1) => (NeonOp::VSLI, true),
+        (0b0100, 1) => (NeonOp::VSRI, false),
+        _ => return Err(DecodeError::Incomplete), // vrshr/vrsra/vqshl/vsri-U0 etc. not yet
+    };
+
+    let shift = if is_left {
+        if esize == 64 { imm6 } else { imm6 - esize }
+    } else if esize == 64 {
+        64 - imm6
+    } else {
+        2 * esize - imm6
+    };
+
+    // `vshr`/`vsra` carry signedness (arithmetic vs logical) and render `.s/.u`; plain `vshl`
+    // renders `.iN`; the insert forms `vsli`/`vsri` render `.N` (no signedness), matching capstone.
+    let dt = match op {
+        NeonOp::VSHR | NeonOp::VSRA => {
+            if U == 1 {
+                SIMDDataType::Unsigned(esize as u8)
+            } else {
+                SIMDDataType::Signed(esize as u8)
+            }
+        }
+        NeonOp::VSLI | NeonOp::VSRI => SIMDDataType::Any(esize as u8),
+        _ => SIMDDataType::Int(esize as u8),
+    };
+
+    let D = ((word >> 22) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    let dnum = (D << 4) | Vd;
+    let mnum = (M << 4) | Vm;
+
+    Ok((
+        Opcode::Neon { op, dt },
+        [simd_qd(Q, dnum), simd_qd(Q, mnum), Operand::Imm(shift), Operand::Nothing],
     ))
 }
 
@@ -1091,6 +2006,21 @@ fn decode_vfp_cvt(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
     let fp_ty = if sz { VfpType::F64 } else { VfpType::F32 };
 
     match opc2 {
+        0b0010 | 0b0011 => {
+            // vcvtb/vcvtt between half (f16) and single (f32). opc2 bit0 = op (0: f16 -> f32,
+            // 1: f32 -> f16); bit7 = T (top/bottom half). Single precision only (sz must be 0).
+            if sz {
+                return Err(DecodeError::InvalidOpcode);
+            }
+            let to_half = opc2 & 1 == 1;
+            let top = bit7;
+            // Both operands are single registers; the f16 sits in a 16-bit half of one of them.
+            let dd = vfp_reg(false, Vd, D);
+            let dm = vfp_reg(false, Vm, M);
+            Ok((Opcode::VCVTHalf { to_half, top }, [
+                Operand::SIMDReg(dd), Operand::SIMDReg(dm), Operand::Nothing, Operand::Nothing,
+            ]))
+        }
         0b0111 => {
             // VCVT between f32 and f64 (only valid with bit7 == 1). the destination has the other
             // width from the operation size.
@@ -1323,17 +2253,7 @@ pub(crate) fn decode_thumb_neon_dp(hw1: u16, hw2: u16) -> Result<(Opcode, [Opera
     let thumb = ((hw1 as u32) << 16) | (hw2 as u32);
     let u = (thumb >> 28) & 1;
     let a32 = 0xf200_0000 | (u << 24) | (thumb & 0x00ff_ffff);
-
-    // "one register and modified immediate": bit23 == 1, bits[21:19] == 000, bit7 == 0, bit4 == 1.
-    let is_1reg_imm = (a32 >> 23) & 1 == 1
-        && (a32 >> 19) & 0b111 == 0
-        && (a32 >> 7) & 1 == 0
-        && (a32 >> 4) & 1 == 1;
-    if is_1reg_imm {
-        decode_neon_dp_1reg_imm(a32)
-    } else {
-        Err(DecodeError::Incomplete)
-    }
+    decode_neon_dataproc(a32)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1499,6 +2419,20 @@ pub enum Operand {
     /// extension-register load/store instructions (`vldm`/`vstm`/`vpush`/`vpop`). fields are the
     /// first register and the count of registers in the list.
     SIMDRegList(SIMDReg, u8),
+    /// a NEON structure/element load-store register list: `count` doubleword registers starting at
+    /// `first`, each `stride` doublewords apart (1 or 2), addressed per `element` (whole register,
+    /// one lane, or all lanes). covers every `vld1`-`vld4`/`vst1`-`vst4` list shape - `{d0, d2}`
+    /// (strided multiple), `{d0[1], d1[1]}` (single to one lane), `{d0[], d1[]}` (to all lanes).
+    SIMDRegPoints {
+        /// the first register in the list.
+        first: SIMDReg,
+        /// how many registers the list names.
+        count: u8,
+        /// the gap between consecutive registers, in doublewords (1 = contiguous, 2 = strided).
+        stride: u8,
+        /// which part of each register participates.
+        element: SIMDElement,
+    },
     /// a NEON structure-load/store memory operand: `[rn]`, `[rn:align]`, `[rn]!`, or `[rn], rm`.
     SIMDDeref {
         /// the base register holding the address.
@@ -1590,6 +2524,14 @@ pub trait OperandVisitor {
     fn visit_simd_reg_lane(&mut self, reg: SIMDReg, lane: u8) -> Result<Self::Ok, Self::Error>;
     /// process an operand that is a contiguous list of VFP/Advanced-SIMD registers.
     fn visit_simd_reg_list(&mut self, first: SIMDReg, count: u8) -> Result<Self::Ok, Self::Error>;
+    /// process an operand that is a NEON structure/element load-store register list.
+    fn visit_simd_reg_points(
+        &mut self,
+        first: SIMDReg,
+        count: u8,
+        stride: u8,
+        element: SIMDElement,
+    ) -> Result<Self::Ok, Self::Error>;
     /// process an operand that is a NEON structure-load/store memory reference.
     fn visit_simd_deref(&mut self, base: Reg, align: u16, wback: bool, post: Option<Reg>) -> Result<Self::Ok, Self::Error>;
     /// process an operand that is a bare immediate printed as written.
@@ -2346,6 +3288,13 @@ impl Decoder<ARMv7> for InstDecoder {
                 if (word >> 24) & 0b1111 == 0b0100 {
                     // NEON structure load/store (1111 0100 ...).
                     let (opcode, operands) = decode_neon_loadstore(word)?;
+                    inst.opcode = opcode;
+                    inst.operands = operands;
+                    return Ok(());
+                }
+                if (word >> 25) & 0b111 == 0b001 {
+                    // NEON data-processing (1111 001x ...).
+                    let (opcode, operands) = decode_neon_dataproc(word)?;
                     inst.opcode = opcode;
                     inst.operands = operands;
                     return Ok(());

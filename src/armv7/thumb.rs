@@ -91,6 +91,23 @@ fn DecodeImmShift(reg: u8, ty: u8, imm5: u8) -> RegShift {
     )
 }
 
+/// Map the 3-bit `op1` (bits[22:20]) of a Thumb `Parallel addition and
+/// subtraction` instruction to its row in the opcode tables, whose rows are
+/// ordered add16, asx, sax, sub16, add8, sub8. The `op1` encoding is
+/// non-contiguous (000=add8, 001=add16, 010=asx, 100=sub8, 101=sub16, 110=sax);
+/// values 011 and 111 are undefined.
+fn parallel_group_row(op1: usize) -> Result<usize, DecodeError> {
+    Ok(match op1 {
+        0b001 => 0, // add16
+        0b010 => 1, // asx
+        0b110 => 2, // sax
+        0b101 => 3, // sub16
+        0b000 => 4, // add8
+        0b100 => 5, // sub8
+        _ => return Err(DecodeError::InvalidOpcode),
+    })
+}
+
 #[allow(non_snake_case)]
 pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(decoder: &InstDecoder, inst: &mut Instruction, words: &mut T) -> Result<(), <ARMv7 as Arch>::DecodeError> {
     // these are cleared in `armv7::InstDecoder::decode_into`.
@@ -409,8 +426,9 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                                             Operand::Nothing,
                                         ];
                                     }
-                                    0b0110 => {
-                                        // `LDREXD`
+                                    0b0111 => {
+                                        // `LDREXD` (hw2 bits[7:4] == 0b0111, matching
+                                        // STREXD; the load bit lives in hw1, not op3).
                                         if rt == 13 || rt == 15 || rt2 == 13 || rt2 == 15 || rn == 15 {
                                             decoder.unpredictable()?;
                                         }
@@ -2954,15 +2972,25 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                             }
                         } else {
                             let op2 = op2.load::<u8>();
+                            // The parallel add/sub and misc (`sel`/`clz`/`rev`/`qadd`)
+                            // encodings all carry a fixed `1111` in the second
+                            // halfword's bits[15:12]; any other value is UNDEFINED.
+                            if lower2[12..16].load::<u8>() != 0b1111 {
+                                return Err(DecodeError::Undefined);
+                            }
                             if op2 < 0b0100 {
                                 // `Parallel addition and subtraction, signed`
                                 let op1 = instr2[4..7].load::<usize>();
                                 let op2 = lower2[4..6].load::<usize>();
-                                if op1 == 0 || op1 > 0b100 || op2 == 0b11 {
+                                if op2 == 0b11 {
                                     return Err(DecodeError::InvalidOpcode);
                                 }
-
-                                let opcode_idx = (op1 - 1) * 3 + op2;
+                                // op1 (bits[22:20]) selects the operation group, but
+                                // its encoding is non-contiguous (000=add8, 001=add16,
+                                // 010=asx, 100=sub8, 101=sub16, 110=sax); map it to the
+                                // group's row in the opcode table below. op2 (bits[5:4])
+                                // picks the plain/Q/H column within the row.
+                                let opcode_idx = parallel_group_row(op1)? * 3 + op2;
 
                                 let rn = instr2[0..4].load::<u8>();
                                 let rd = lower2[8..12].load::<u8>();
@@ -2998,14 +3026,13 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                                 // `Parallel addition and subtraction, unsigned` (`A6-244`)
                                 let op1 = instr2[4..7].load::<usize>();
                                 let op2 = lower2[4..6].load::<usize>();
-                                if op1 > 0b100 || op2 == 0b11 {
+                                if op2 == 0b11 {
                                     return Err(DecodeError::InvalidOpcode);
                                 }
-
-                                if op1 == 0 {
-                                    return Err(DecodeError::InvalidOpcode);
-                                }
-                                let opcode_idx = (op1 - 1) * 3 + op2;
+                                // Same non-contiguous op1 group encoding as the signed
+                                // table above; the unsigned opcode table shares the row
+                                // ordering (add16, asx, sax, sub16, add8, sub8).
+                                let opcode_idx = parallel_group_row(op1)? * 3 + op2;
 
                                 let rn = instr2[0..4].load::<u8>();
                                 let rd = lower2[8..12].load::<u8>();
@@ -4283,16 +4310,62 @@ fn decode_table_a6_30(decoder: &InstDecoder, inst: &mut Instruction, instr2: Bit
             Operand::Nothing,
         ];
         return Err(DecodeError::InvalidOpcode);
-    } else if op1 & 0b110000 == 0b110000 {
-        // `Advanced SIMD data-processing instructions` (A7-259). Only the one-register-and-
-        // modified-immediate `vmov` form is decoded (via the shared A32 decoder); the rest is
-        // still TODO.
-        let hw1 = instr2[0..16].load::<u16>();
-        let hw2 = lower2[0..16].load::<u16>();
-        let (opcode, operands) = decode_thumb_neon_dp(hw1, hw2)?;
-        inst.opcode = opcode;
-        inst.operands = operands;
-        return Ok(());
+    } else if op1 & 0b100000 == 0b100000 {
+        // op1 = `1xxxxx`: the coprocessor / Advanced-SIMD / VFP data-processing space
+        // (bits[27:25] = `111`). bits[27:24] (`instr2[8..12]`, the low nibble of the
+        // first halfword's top byte) split it: `1111` is Advanced SIMD data-processing;
+        // `1110` is the coprocessor / VFP space (VFP data-processing and transfers when
+        // coproc == 101x, else CDP / MCR / MRC). The distinguishing bit is bit24
+        // (`instr2[8]`). (op1 = `0xxxxx` - the load/store and 64-bit-transfer forms -
+        // stays in the branch below.)
+        if instr2[8] {
+            // `111x 1111`: Advanced SIMD data-processing (A7-259). Decoded via the
+            // shared A32 decoder (three-same, modified-immediate, ... as it grows).
+            let hw1 = instr2[0..16].load::<u16>();
+            let hw2 = lower2[0..16].load::<u16>();
+            let (opcode, operands) = decode_thumb_neon_dp(hw1, hw2)?;
+            inst.opcode = opcode;
+            inst.operands = operands;
+            return Ok(());
+        }
+        // `111x 1110`: coprocessor / VFP. coproc `101x` is VFP data-processing and the
+        // 8/16/32-bit core<->extension register transfers (shared A32 VFP decoder);
+        // any other coproc is a generic `CDP` / `MCR` / `MRC`.
+        let coproc = lower2[8..12].load::<u8>();
+        if coproc & 0b1110 == 0b1010 {
+            let hw1 = instr2[0..16].load::<u16>();
+            let hw2 = lower2[0..16].load::<u16>();
+            let (opcode, operands) = decode_thumb_coproc(hw1, hw2)?;
+            inst.opcode = opcode;
+            inst.operands = operands;
+            return Ok(());
+        }
+        // Generic coprocessor CDP / MCR / MRC. The full instruction shares bits[27:0]
+        // with the A32 forms; bit4 (`lower2[4]`) selects a register move (`MCR`/`MRC`)
+        // over a data operation (`CDP`), and bit20 (`instr2[4]`) the direction (`MRC`
+        // read / `MCR` write). In user-mode Vita code this is the thread-ID register
+        // move `p15,0,Rt,c13,c0,{2,3}` that reaches thread-local storage; `CDP` is not
+        // emitted.
+        if lower2[4] {
+            let crm = lower2[0..4].load::<u8>();
+            let opc2 = lower2[5..8].load::<u8>();
+            let rt = lower2[12..16].load::<u8>();
+            let crn = instr2[0..4].load::<u8>();
+            let opc1 = instr2[5..8].load::<u8>();
+            if instr2[4] {
+                inst.opcode = Opcode::MRC(coproc, opc1, opc2, false);
+            } else {
+                inst.opcode = Opcode::MCR(coproc, opc1, opc2, false);
+            }
+            inst.operands = [
+                Operand::Reg(Reg::from_u8(rt)),
+                Operand::CReg(CReg::from_u8(crn)),
+                Operand::CReg(CReg::from_u8(crm)),
+                Operand::Nothing,
+            ];
+            return Ok(());
+        }
+        return Err(DecodeError::Incomplete);
     } else {
         let coproc = lower2[8..12].load::<u8>();
         if coproc & 0b1110 != 0b1010 {

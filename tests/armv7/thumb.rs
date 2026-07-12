@@ -4398,3 +4398,27 @@ fn test_decode_tbh_operand_shape() {
         other => panic!("unexpected TBH operand: {:?}", other),
     }
 }
+
+// NEON data-processing decode smoke test: the exact instructions gcc -O2 auto-vectorization emits
+// for byte-sum / short-widen / abs-diff loops (from the vitaslop neon-probe disassembly). Renderings
+// are objdump's; the differential-tests capstone oracle covers the full space.
+#[test]
+fn neon_dataproc_autovec() {
+    let cases: &[([u8; 4], &str)] = &[
+        ([0xc8, 0xff, 0x32, 0x4a], "vmovl.u8 q10, d18"),
+        ([0xd0, 0xff, 0xa4, 0x01], "vaddw.u16 q8, q8, d20"),
+        ([0x20, 0xef, 0xa1, 0x78], "vadd.i32 d7, d16, d17"),
+        ([0x27, 0xef, 0x17, 0x7b], "vpadd.i32 d7, d7, d7"),
+        ([0xd0, 0xef, 0x30, 0x2a], "vmovl.s16 q9, d16"),
+        ([0xd2, 0xef, 0xa4, 0x21], "vaddw.s16 q9, q9, d20"),
+        ([0xc2, 0xff, 0xa4, 0x07], "vabdl.u8 q8, d18, d20"),
+        ([0xc3, 0xff, 0xa5, 0x05], "vabal.u8 q8, d19, d21"),
+        ([0xf4, 0xff, 0xe0, 0x66], "vpadal.u16 q11, q8"),
+        ([0xc0, 0xef, 0x50, 0x00], "vmov.i32 q8, 0x0"),
+    ];
+    for (bytes, expected) in cases {
+        let mut reader = yaxpeax_arch::U8Reader::new(&bytes[..]);
+        let inst = InstDecoder::default_thumb().decode(&mut reader).unwrap();
+        assert_eq!(format!("{}", inst), *expected, "bytes {:02x?}", bytes);
+    }
+}

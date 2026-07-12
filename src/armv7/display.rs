@@ -408,6 +408,39 @@ impl<T: DisplaySink> crate::armv7::OperandVisitor for DisplayingOperandVisitor<'
         Ok(())
     }
 
+    fn visit_simd_reg_points(
+        &mut self,
+        first: crate::armv7::SIMDReg,
+        count: u8,
+        stride: u8,
+        element: crate::armv7::SIMDElement,
+    ) -> Result<Self::Ok, Self::Error> {
+        use crate::armv7::{SIMDElement, SIMDReg};
+        self.f.write_char('{')?;
+        for i in 0..count {
+            if i != 0 {
+                self.f.write_fixed_size(", ")?;
+            }
+            let reg = SIMDReg::new(first.size, first.num.wrapping_add(i * stride));
+            self.f.span_start_register();
+            write_simd_reg(self.f, reg)?;
+            self.f.span_end_register();
+            match element {
+                SIMDElement::Whole => {}
+                SIMDElement::Lane(lane) => {
+                    self.f.write_char('[')?;
+                    write_dec_u8(self.f, lane)?;
+                    self.f.write_char(']')?;
+                }
+                SIMDElement::AllLanes => {
+                    self.f.write_fixed_size("[]")?;
+                }
+            }
+        }
+        self.f.write_char('}')?;
+        Ok(())
+    }
+
     fn visit_simd_deref(&mut self, base: Reg, align: u16, wback: bool, post: Option<Reg>) -> Result<Self::Ok, Self::Error> {
         self.f.write_char('[')?;
         self.f.write_reg(base.number())?;
@@ -798,6 +831,28 @@ pub(crate) fn visit_inst<T: DisplaySink>(instr: &Instruction, out: &mut T) -> fm
             out.write_reg(rt.number())?;
             return Ok(());
         }
+        Opcode::VCVTHalf { to_half, .. } => {
+            use crate::armv7::VfpType;
+            let (to, from) = if to_half {
+                (VfpType::F16, VfpType::F32)
+            } else {
+                (VfpType::F32, VfpType::F16)
+            };
+            out.span_start_opcode();
+            instr.write_conditioned_opcode(&instr.opcode, out)?;
+            out.write_char('.')?;
+            out.write_fixed_size(vfp_type_name(to))?;
+            out.write_char('.')?;
+            out.write_fixed_size(vfp_type_name(from))?;
+            out.span_end_opcode();
+            out.write_char(' ')?;
+            let mut op_visitor = DisplayingOperandVisitor { f: out };
+            instr.operands[0].visit(&mut op_visitor)?;
+            out.write_fixed_size(", ")?;
+            let mut op_visitor = DisplayingOperandVisitor { f: out };
+            instr.operands[1].visit(&mut op_visitor)?;
+            return Ok(());
+        }
         Opcode::VCVT { to, from, .. } => {
             out.span_start_opcode();
             instr.write_conditioned_opcode(&instr.opcode, out)?;
@@ -812,6 +867,41 @@ pub(crate) fn visit_inst<T: DisplaySink>(instr: &Instruction, out: &mut T) -> fm
             out.write_fixed_size(", ")?;
             let mut op_visitor = DisplayingOperandVisitor { f: out };
             instr.operands[1].visit(&mut op_visitor)?;
+            return Ok(());
+        }
+        Opcode::Neon { dt, .. } => {
+            // NEON data-processing mnemonics carry no `s`/`.w`/condition decoration (the encodings
+            // are unconditional and full-width), so write the bare mnemonic, not the conditioned one.
+            out.span_start_opcode();
+            unsafe {
+                out.write_lt_8(instr.opcode.name())?;
+            }
+            out.write_char('.')?;
+            write_simd_dt(out, dt)?;
+            out.span_end_opcode();
+            // A NEON immediate (the `vmov.iN` broadcast value) is rendered as prefixed hex, matching
+            // how yax renders every other immediate (and so the oracle's radix/sign folding applies);
+            // register operands go through the normal visitor.
+            let write_op = |out: &mut T, op: &Operand| -> fmt::Result {
+                if let Operand::Imm(v) = op {
+                    out.write_prefixed_u32(*v)
+                } else {
+                    let mut op_visitor = DisplayingOperandVisitor { f: out };
+                    op.visit(&mut op_visitor)
+                }
+            };
+            let mut ops = instr.operands.iter();
+            if let Some(first_op) = ops.next() {
+                out.write_char(' ')?;
+                write_op(out, first_op)?;
+            }
+            for op in ops {
+                if let Operand::Nothing = op {
+                    break;
+                }
+                out.write_fixed_size(", ")?;
+                write_op(out, op)?;
+            }
             return Ok(());
         }
         Opcode::VDUP(dt) | Opcode::VMOVLane(dt)
@@ -1259,7 +1349,9 @@ impl <T: fmt::Write, Y: YaxColors> Colorize<T, Y> for ConditionedOpcode {
             Opcode::VMOVLane(_) |
             Opcode::VLDN(_, _) |
             Opcode::VSTN(_, _) |
+            Opcode::Neon { .. } |
             Opcode::VCVT { .. } => { write!(out, "{}", colors.arithmetic_op(self)) },
+            Opcode::VCVTHalf { .. } => { write!(out, "{}", colors.arithmetic_op(self)) },
         }
     }
 }
@@ -1555,6 +1647,8 @@ impl Opcode {
             Opcode::VMOVLane(_) => { "vmov" },
             Opcode::VCVT { round: false, .. } => { "vcvt" },
             Opcode::VCVT { round: true, .. } => { "vcvtr" },
+            Opcode::VCVTHalf { top: false, .. } => { "vcvtb" },
+            Opcode::VCVTHalf { top: true, .. } => { "vcvtt" },
             Opcode::VLDN(1, _) => { "vld1" },
             Opcode::VLDN(2, _) => { "vld2" },
             Opcode::VLDN(3, _) => { "vld3" },
@@ -1563,6 +1657,73 @@ impl Opcode {
             Opcode::VSTN(2, _) => { "vst2" },
             Opcode::VSTN(3, _) => { "vst3" },
             Opcode::VSTN(_, _) => { "vst4" },
+            Opcode::Neon { op, .. } => {
+                use crate::armv7::NeonOp;
+                match op {
+                    NeonOp::VADD => "vadd",
+                    NeonOp::VSUB => "vsub",
+                    NeonOp::VMUL => "vmul",
+                    NeonOp::VMLA => "vmla",
+                    NeonOp::VMLS => "vmls",
+                    NeonOp::VMAX => "vmax",
+                    NeonOp::VMIN => "vmin",
+                    NeonOp::VPADD => "vpadd",
+                    NeonOp::VABD => "vabd",
+                    NeonOp::VADDL => "vaddl",
+                    NeonOp::VADDW => "vaddw",
+                    NeonOp::VSUBL => "vsubl",
+                    NeonOp::VSUBW => "vsubw",
+                    NeonOp::VMLAL => "vmlal",
+                    NeonOp::VMLSL => "vmlsl",
+                    NeonOp::VMULL => "vmull",
+                    NeonOp::VABDL => "vabdl",
+                    NeonOp::VABAL => "vabal",
+                    NeonOp::VPADDL => "vpaddl",
+                    NeonOp::VPADAL => "vpadal",
+                    NeonOp::VABS => "vabs",
+                    NeonOp::VNEG => "vneg",
+                    NeonOp::VMOVL => "vmovl",
+                    NeonOp::VMOVI => "vmov",
+                    NeonOp::VAND => "vand",
+                    NeonOp::VBIC => "vbic",
+                    NeonOp::VORR => "vorr",
+                    NeonOp::VORN => "vorn",
+                    NeonOp::VEOR => "veor",
+                    NeonOp::VBSL => "vbsl",
+                    NeonOp::VBIT => "vbit",
+                    NeonOp::VBIF => "vbif",
+                    NeonOp::VSHR => "vshr",
+                    NeonOp::VSRA => "vsra",
+                    NeonOp::VSHL => "vshl",
+                    NeonOp::VSLI => "vsli",
+                    NeonOp::VSRI => "vsri",
+                    NeonOp::VEXT => "vext",
+                    NeonOp::VCVTFtoI | NeonOp::VCVTItoF => "vcvt",
+                    NeonOp::VCEQ => "vceq",
+                    NeonOp::VCGT => "vcgt",
+                    NeonOp::VCGE => "vcge",
+                    NeonOp::VCLE => "vcle",
+                    NeonOp::VCLT => "vclt",
+                    NeonOp::VACGE => "vacge",
+                    NeonOp::VACGT => "vacgt",
+                    NeonOp::VPMAX => "vpmax",
+                    NeonOp::VPMIN => "vpmin",
+                    NeonOp::VREV16 => "vrev16",
+                    NeonOp::VREV32 => "vrev32",
+                    NeonOp::VREV64 => "vrev64",
+                    NeonOp::VQSHL => "vqshl",
+                    NeonOp::VRECPE => "vrecpe",
+                    NeonOp::VRSQRTE => "vrsqrte",
+                    NeonOp::VRECPS => "vrecps",
+                    NeonOp::VRSQRTS => "vrsqrts",
+                    NeonOp::VTRN => "vtrn",
+                    NeonOp::VZIP => "vzip",
+                    NeonOp::VUZP => "vuzp",
+                    NeonOp::VSWP => "vswp",
+                    NeonOp::VTST => "vtst",
+                    NeonOp::VMOVN => "vmovn",
+                }
+            },
         }
     }
 }
@@ -1727,6 +1888,9 @@ impl super::Operand {
             },
             Operand::SIMDRegList(first, count) => {
                 visitor.visit_simd_reg_list(first, count)
+            },
+            Operand::SIMDRegPoints { first, count, stride, element } => {
+                visitor.visit_simd_reg_points(first, count, stride, element)
             },
             Operand::SIMDDeref { base, align, wback, post } => {
                 visitor.visit_simd_deref(base, align, wback, post)
