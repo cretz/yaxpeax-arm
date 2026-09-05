@@ -432,6 +432,55 @@ pub enum NeonOp {
     // Narrowing move (two registers): each `2*esize`-bit element of the `Qm` source is truncated to
     // its low `esize` bits and written to the `Dd` result.
     VMOVN,
+    // Saturating narrowing moves (two registers), the same shape as VMOVN but clamping instead of
+    // truncating. VQMOVN keeps the source's signedness (`.sNN` signed -> signed, `.uNN` unsigned ->
+    // unsigned); VQMOVUN takes a SIGNED source to an UNSIGNED result, so it is a distinct opcode
+    // rather than a `dt` variation - the three differ in what they clamp to and cannot be folded.
+    VQMOVN,
+    VQMOVUN,
+    // Table lookup (`vtbl`/`vtbx`): each byte of the `Dm` index register selects a byte from a table
+    // of `len` consecutive D registers starting at `Dn`. An index at or past the table's end writes
+    // zero (VTBL) or leaves the destination byte alone (VTBX). The table's length rides in the
+    // operand list as a `SIMDRegPoints` run, exactly like a `vld1` register list.
+    VTBL,
+    VTBX,
+    // Rounding right shifts (two registers and an immediate): the same shift as VSHR/VSRA with
+    // a half-ulp added before the discard, so the result is rounded rather than truncated.
+    VRSHR,
+    VRSRA,
+    // NARROWING right shifts (two registers and an immediate): shift each `2*esize` element of
+    // the `Qm` source right and write `esize` results to `Dd`. The V*Q* forms saturate on the
+    // way down and the V*R* forms round before it; VQSHRUN takes a SIGNED source to an
+    // UNSIGNED result, so it is its own opcode for the same reason VQMOVUN is.
+    VSHRN,
+    VRSHRN,
+    VQSHRN,
+    VQRSHRN,
+    VQSHRUN,
+    VQRSHRUN,
+    // Widening shift left (two registers and an immediate): each `esize` element of `Dm` is
+    // widened to `2*esize` and shifted left. `VMOVL` is the shift-by-zero case and keeps its
+    // own opcode because that is how it is written and rendered.
+    VSHLL,
+    // Saturating add/subtract (three registers of the same length): clamp to the element's
+    // range instead of wrapping. In a mixer that is the difference between a peak and a
+    // sample of the opposite sign, so they are their own opcodes and never folded into
+    // VADD/VSUB.
+    VQADD,
+    VQSUB,
+    // Rounding halving add (three registers): `(a + b + 1) >> 1`, computed without
+    // overflowing the element - the standard way to average two samples in-place.
+    VRHADD,
+    // Halving add/subtract (three registers): `(a +- b) >> 1`, truncating.
+    VHADD,
+    VHSUB,
+    // Bitwise NOT (two registers, miscellaneous).
+    VMVN,
+    // Saturating absolute value / negate (two registers, miscellaneous): the saturating
+    // siblings of VABS/VNEG, which differ only at the element's minimum, where the true
+    // result is one past the maximum.
+    VQABS,
+    VQNEG,
 }
 
 /// a VFP scalar data type, used to render the `.<ty>` suffixes of `vcvt`.
@@ -1349,6 +1398,18 @@ fn decode_neon_3same(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
     }
 
     let (op, dt) = match (B, bit4) {
+        // Saturating add/subtract (bits[11:8] == 0000/0010, bit4 == 1) and the halving
+        // adds that share their opcode space (bit4 == 0). `vqadd`/`vqsub` carry the
+        // element's signedness because what they clamp to depends on it.
+        (0b0000, 1) => (NeonOp::VQADD, signed()),
+        (0b0010, 1) => (NeonOp::VQSUB, signed()),
+        (0b0000, 0) => (NeonOp::VHADD, signed()),
+        (0b0010, 0) => (NeonOp::VHSUB, signed()),
+        (0b0001, 0) => (NeonOp::VRHADD, signed()),
+        // Integer pairwise max/min (bits[11:8] == 1010): the doubleword-only siblings of
+        // the float forms above.
+        (0b1010, 0) if !Q => (NeonOp::VPMAX, signed()),
+        (0b1010, 1) if !Q => (NeonOp::VPMIN, signed()),
         // Integer compares: `vcgt`/`vcge` (bits[11:8] == 0011, signedness from U), and `vceq`
         // (bits[11:8] == 1000, bit4 == 1, U == 1 - U == 0 there is `vtst`, not decoded yet).
         (0b0011, 0) => (NeonOp::VCGT, signed()),
@@ -1446,6 +1507,17 @@ fn decode_neon_2misc(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
     if (word >> 8) & 0b1111 == 0b1100 && (word >> 7) & 1 == 0 {
         return decode_neon_vdup_scalar(word);
     }
+    // VTBL/VTBX: `vtbl.8 Dd, {Dn..}, Dm` - a byte table lookup. It shares the
+    // bits[21:20] == 11 space with two-registers-misc but has its OWN field layout
+    // (bits[11:10] == 10 select it, bits[9:8] are the table length minus one, bit6
+    // picks VTBX over VTBL, and bits[19:16] are `Vn`, the first table register - not
+    // the 2misc `size`/`B` fields), so it must be split off before the generic decode
+    // exactly as VDUP-scalar is above. Missing this is not a rendering gap: the whole
+    // instruction fails to decode, and a decoder that stops mid-block silently drops
+    // every instruction after it.
+    if (word >> 10) & 0b11 == 0b10 {
+        return decode_neon_table(word);
+    }
     // two-registers-misc is the `U == 1` (bit24 == 1) half of the bits[21:20] == 11 space.
     if (word >> 24) & 1 == 0 {
         return Err(DecodeError::Incomplete);
@@ -1516,6 +1588,28 @@ fn decode_neon_2misc(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
         ));
     }
 
+    // VQMOVN / VQMOVUN (bits[17:16] == 10, bits[11:8] == 0010): the saturating siblings of
+    // VMOVN. `op` = bits[7:6] - which this function has already split into `sub`'s low bit
+    // (bit7) and `Q` (bit6), so the three live at (sub, Q) rather than in one field:
+    //   sub 00100, Q true  -> VQMOVUN.sNN  signed source, unsigned saturated result
+    //   sub 00101, Q false -> VQMOVN.sNN   signed source, signed saturated result
+    //   sub 00101, Q true  -> VQMOVN.uNN   unsigned source, unsigned saturated result
+    // (sub 00100, Q false is VMOVN, handled above.) `esize` is the RESULT element; the
+    // suffix names the source, which is twice that. A 64-bit result element would mean a
+    // 128-bit source element, which is undefined.
+    if B == 0b10 && (sub == 0b0_0100 || sub == 0b0_0101) && esize != 64 {
+        let (op, dt) = match (sub, Q) {
+            (0b0_0100, true) => (NeonOp::VQMOVUN, SIMDDataType::Signed(2 * esize)),
+            (0b0_0101, false) => (NeonOp::VQMOVN, SIMDDataType::Signed(2 * esize)),
+            (0b0_0101, true) => (NeonOp::VQMOVN, SIMDDataType::Unsigned(2 * esize)),
+            _ => return Err(DecodeError::Incomplete),
+        };
+        return Ok((
+            Opcode::Neon { op, dt },
+            [simd_d(dnum), simd_q(mnum), Operand::Nothing, Operand::Nothing],
+        ));
+    }
+
     let (op, dt) = match (B, sub) {
         // VREVn: reverse element order within each 16/32/64-bit container (bits[17:16] == 00,
         // bits[11:7] == 000:op with op = bits[8:7]). The `.NN` suffix names the element size, which
@@ -1530,6 +1624,15 @@ fn decode_neon_2misc(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
         (0b00, 0b0_1100) => (NeonOp::VPADAL, SIMDDataType::Signed(esize)),
         (0b00, 0b0_1101) => (NeonOp::VPADAL, SIMDDataType::Unsigned(esize)),
         // VABS integer / float; VNEG integer / float.
+        // VMVN (bits[17:16] == 00, bits[11:7] == 01011): bitwise NOT, element-size
+        // agnostic, so it renders without a data-type suffix like the logical family.
+        (0b00, 0b0_1011) => (NeonOp::VMVN, SIMDDataType::Any(8)),
+        // VQABS/VQNEG (bits[17:16] == 00, bits[11:7] == 0111:op). They sit in the `B == 00`
+        // group, NOT beside VABS/VNEG in `B == 01`, and they differ from those only at the
+        // element's minimum - where the true magnitude is one past the maximum and has to
+        // clamp rather than stay negative.
+        (0b00, 0b0_1110) => (NeonOp::VQABS, SIMDDataType::Signed(esize)),
+        (0b00, 0b0_1111) => (NeonOp::VQNEG, SIMDDataType::Signed(esize)),
         (0b01, 0b0_0110) => (NeonOp::VABS, SIMDDataType::Signed(esize)),
         (0b01, 0b0_1110) if float_ok => (NeonOp::VABS, SIMDDataType::Float(esize)),
         (0b01, 0b0_0111) => (NeonOp::VNEG, SIMDDataType::Signed(esize)),
@@ -1559,6 +1662,54 @@ fn decode_neon_2misc(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
     Ok((
         Opcode::Neon { op, dt },
         [simd_qd(Q, dnum), simd_qd(Q, mnum), Operand::Nothing, Operand::Nothing],
+    ))
+}
+
+/// VTBL/VTBX: `vtbl.8 Dd, {Dn, Dn+1, ...}, Dm` - a byte-granular table lookup.
+///
+/// `1111 0011 1 D 11 Vn 10 Vd 10 len op N M 0 Vm`: bits[11:10] == 10 select this class,
+/// bits[9:8] are `len` (the table holds `len + 1` consecutive D registers starting at
+/// `Dn`), bit6 is `op` (0 -> VTBL, 1 -> VTBX) and bit7/bit5/bit22 are the usual N/M/D
+/// high bits. Every operand is a D register and the operation is always byte-granular,
+/// so the data type is `.8` regardless of what the table holds.
+///
+/// The table is rendered as a register RUN (`SIMDRegPoints`), the same operand a `vld1`
+/// register list uses, so a consumer reads its first register and count the same way in
+/// both places.
+#[allow(non_snake_case)]
+fn decode_neon_table(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let len = ((word >> 8) & 0b11) as u8 + 1;
+    let op = (word >> 6) & 1;
+    let D = ((word >> 22) & 1) as u8;
+    let N = ((word >> 7) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vn = ((word >> 16) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    let dnum = (D << 4) | Vd;
+    let nnum = (N << 4) | Vn;
+    let mnum = (M << 4) | Vm;
+    // The table must not run off the end of the 32-register file - an encoding that does
+    // is UNPREDICTABLE on hardware, so it is refused rather than wrapped.
+    if nnum as u16 + len as u16 > 32 {
+        return Err(DecodeError::InvalidOperand);
+    }
+    Ok((
+        Opcode::Neon {
+            op: if op == 0 { NeonOp::VTBL } else { NeonOp::VTBX },
+            dt: SIMDDataType::Any(8),
+        },
+        [
+            simd_d(dnum),
+            Operand::SIMDRegPoints {
+                first: SIMDReg::new(SIMDSizeCode::D, nnum),
+                count: len,
+                stride: 1,
+                element: SIMDElement::Whole,
+            },
+            simd_d(mnum),
+            Operand::Nothing,
+        ],
     ))
 }
 
@@ -1647,17 +1798,24 @@ fn decode_neon_2shift(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> 
     let B = (word >> 8) & 0b1111;
     // The immediate shift-by-N forms (opc = bits[11:8] in {0000,0001,0100,0101}) share this class
     // with `vmovl`. Element size and shift come from `L:immh` and `imm6`.
-    if matches!(B, 0b0000 | 0b0001 | 0b0100 | 0b0101) {
+    // The same-width immediate shifts, including the ROUNDING forms (opc 0010/0011).
+    if matches!(B, 0b0000 | 0b0001 | 0b0010 | 0b0011 | 0b0100 | 0b0101) {
         return decode_neon_shift_imm(word);
+    }
+    // The NARROWING right shifts: opc = bits[11:8] in {1000, 1001}. They are a separate
+    // shape from everything else in this class - a `Qm` source, a `Dd` result, and an
+    // element size taken from the RESULT rather than the operand - so they decode apart.
+    if matches!(B, 0b1000 | 0b1001) {
+        return decode_neon_shift_narrow(word);
     }
     // `vmovl`/`vshll` occupy bits[11:8] == 1010 with bits[7:6] == 00.
     if B != 0b1010 || (word >> 6) & 0b11 != 0 {
         return Err(DecodeError::Incomplete);
     }
     // `vmovl` is the bits[18:16] == 0 case; imm3 == bits[21:19] selects the (power-of-two) element
-    // size 8/16/32. anything else is a genuine `vshll #n`, not decoded here.
+    // size 8/16/32. Anything else is a genuine `vshll #n`.
     if (word >> 16) & 0b111 != 0 {
-        return Err(DecodeError::Incomplete);
+        return decode_neon_shll(word);
     }
     let imm3 = (word >> 19) & 0b111;
     let esize: u8 = match imm3 {
@@ -1711,10 +1869,16 @@ fn decode_neon_shift_imm(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeErro
     let (op, is_left) = match (opc, U) {
         (0b0000, _) => (NeonOp::VSHR, false),
         (0b0001, _) => (NeonOp::VSRA, false),
+        // The rounding siblings: same shift, half an ulp added before the bits are
+        // discarded. A title uses them where truncation would bias a signal downward
+        // every sample, so decoding them as VSHR would be quietly wrong, not just
+        // unrendered.
+        (0b0010, _) => (NeonOp::VRSHR, false),
+        (0b0011, _) => (NeonOp::VRSRA, false),
         (0b0101, 0) => (NeonOp::VSHL, true),
         (0b0101, 1) => (NeonOp::VSLI, true),
         (0b0100, 1) => (NeonOp::VSRI, false),
-        _ => return Err(DecodeError::Incomplete), // vrshr/vrsra/vqshl/vsri-U0 etc. not yet
+        _ => return Err(DecodeError::Incomplete), // the vqshl immediate forms are not decoded yet
     };
 
     let shift = if is_left {
@@ -1728,7 +1892,7 @@ fn decode_neon_shift_imm(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeErro
     // `vshr`/`vsra` carry signedness (arithmetic vs logical) and render `.s/.u`; plain `vshl`
     // renders `.iN`; the insert forms `vsli`/`vsri` render `.N` (no signedness), matching capstone.
     let dt = match op {
-        NeonOp::VSHR | NeonOp::VSRA => {
+        NeonOp::VSHR | NeonOp::VSRA | NeonOp::VRSHR | NeonOp::VRSRA => {
             if U == 1 {
                 SIMDDataType::Unsigned(esize as u8)
             } else {
@@ -1749,6 +1913,113 @@ fn decode_neon_shift_imm(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeErro
     Ok((
         Opcode::Neon { op, dt },
         [simd_qd(Q, dnum), simd_qd(Q, mnum), Operand::Imm(shift), Operand::Nothing],
+    ))
+}
+
+/// The NARROWING immediate right shifts: `vshrn`/`vrshrn`/`vqshrn`/`vqrshrn`/`vqshrun`/
+/// `vqrshrun`.
+///
+/// `1111 001 U 1 D immh imm6 Vd 100 op L Q M 1 Vm`: opc (bits[11:8]) is `100op`, and the
+/// family is `(U, op, Q)` - where `Q` (bit6) is NOT a register-width selector here (every
+/// form of this shape is `Dd, Qm`) but the ROUNDING bit:
+///
+/// | U | op(bit8) | round(bit6) | instruction | source -> result |
+/// |---|---|---|---|---|
+/// | 0 | 0 | 0 | `vshrn`    | any -> truncated |
+/// | 0 | 0 | 1 | `vrshrn`   | any -> rounded |
+/// | 1 | 0 | 0 | `vqshrun`  | signed -> UNSIGNED, saturating |
+/// | 1 | 0 | 1 | `vqrshrun` | signed -> UNSIGNED, rounded + saturating |
+/// | 0 | 1 | 0 | `vqshrn`   | signed -> signed, saturating |
+/// | 0 | 1 | 1 | `vqrshrn`  | signed -> signed, rounded + saturating |
+/// | 1 | 1 | 0 | `vqshrn`   | unsigned -> unsigned, saturating |
+/// | 1 | 1 | 1 | `vqrshrn`  | unsigned -> unsigned, rounded + saturating |
+///
+/// The element size in `L:immh` names the RESULT (the source elements are twice it), and
+/// the shift is `2 * esize - imm6`, both as for the same-width right shifts. `L` is
+/// always 0 here - a 64-bit result would need a 128-bit source element - so an `L` of 1
+/// is refused rather than decoded into a shape that does not exist.
+#[allow(non_snake_case)]
+fn decode_neon_shift_narrow(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let U = (word >> 24) & 1;
+    let op = (word >> 8) & 1;
+    // The ROUNDING bit is bit6, not bit7. Bit7 is `L`, part of the element size, and it
+    // must be 0 here: a 64-bit result element would need a 128-bit source element, which
+    // does not exist.
+    let round = (word >> 6) & 1;
+    if (word >> 7) & 1 != 0 {
+        return Err(DecodeError::Incomplete);
+    }
+    let imm6 = (word >> 16) & 0b11_1111;
+    let immh = imm6 >> 3;
+    let esize: u32 = if immh & 0b100 != 0 {
+        32
+    } else if immh & 0b010 != 0 {
+        16
+    } else if immh & 0b001 != 0 {
+        8
+    } else {
+        return Err(DecodeError::Incomplete);
+    };
+    let shift = 2 * esize - imm6;
+
+    let src = 2 * esize as u8;
+    let (neon_op, dt) = match (U, op, round) {
+        (0, 0, 0) => (NeonOp::VSHRN, SIMDDataType::Int(src)),
+        (0, 0, 1) => (NeonOp::VRSHRN, SIMDDataType::Int(src)),
+        (1, 0, 0) => (NeonOp::VQSHRUN, SIMDDataType::Signed(src)),
+        (1, 0, 1) => (NeonOp::VQRSHRUN, SIMDDataType::Signed(src)),
+        (0, 1, 0) => (NeonOp::VQSHRN, SIMDDataType::Signed(src)),
+        (0, 1, 1) => (NeonOp::VQRSHRN, SIMDDataType::Signed(src)),
+        (1, 1, 0) => (NeonOp::VQSHRN, SIMDDataType::Unsigned(src)),
+        _ => (NeonOp::VQRSHRN, SIMDDataType::Unsigned(src)),
+    };
+
+    let D = ((word >> 22) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    let dnum = (D << 4) | Vd;
+    let mnum = (M << 4) | Vm;
+    Ok((
+        Opcode::Neon { op: neon_op, dt },
+        [simd_d(dnum), simd_q(mnum), Operand::Imm(shift), Operand::Nothing],
+    ))
+}
+
+/// `vshll.<s|u><esize> Qd, Dm, #imm` - widen each element of `Dm` to twice its size and
+/// shift it left by `imm`, where `1 <= imm < esize`. (`imm == 0` is `vmovl`, decoded by
+/// the caller; `imm == esize` is a different encoding entirely, in the two-registers-misc
+/// class, and is not this one.)
+///
+/// The element size in `immh` names the SOURCE here - the opposite of the narrowing forms
+/// above - and the shift is `imm6 - esize`.
+#[allow(non_snake_case)]
+fn decode_neon_shll(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let U = (word >> 24) & 1;
+    let imm6 = (word >> 16) & 0b11_1111;
+    let immh = imm6 >> 3;
+    let esize: u32 = if immh & 0b100 != 0 {
+        32
+    } else if immh & 0b010 != 0 {
+        16
+    } else if immh & 0b001 != 0 {
+        8
+    } else {
+        return Err(DecodeError::Incomplete);
+    };
+    let shift = imm6 - esize;
+    let dt = if U == 1 {
+        SIMDDataType::Unsigned(esize as u8)
+    } else {
+        SIMDDataType::Signed(esize as u8)
+    };
+    let D = ((word >> 22) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    Ok((
+        Opcode::Neon { op: NeonOp::VSHLL, dt },
+        [simd_q((D << 4) | Vd), simd_d((M << 4) | Vm), Operand::Imm(shift), Operand::Nothing],
     ))
 }
 
@@ -3285,6 +3556,40 @@ impl Decoder<ARMv7> for InstDecoder {
             } else {
                 // op1=0xxxxxxx, "Memory hints, Advanced SIMD instructions, and miscellaneous
                 // instructions on pge A5-215"
+                // Memory hints (table A5-25): `pld{w}`/`pli` with an immediate
+                // (1111 01x1 U {R}01 Rn 1111 imm12) or a register offset
+                // (1111 011x U {R}01 Rn 1111 imm5 type 0 Rm). Preloads have no
+                // architectural effect; they decode so a function that uses them
+                // (newlib's memcpy) lifts instead of stopping at one.
+                if (word >> 20) & 0b0011 == 0b0001 && (word >> 12) & 0b1111 == 0b1111
+                    && (word >> 24) & 0b1100 == 0b0100
+                {
+                    let Rn = ((word >> 16) & 0b1111) as u8;
+                    let U = (word >> 23) & 1 != 0;
+                    // bit 25 set: register form; bit 24: PLD (1) vs PLI (0).
+                    let is_reg = (word >> 25) & 1 != 0;
+                    inst.opcode = if (word >> 24) & 1 != 0 { Opcode::PLD } else { Opcode::PLI };
+                    if !is_reg {
+                        inst.operands = [
+                            Operand::RegDerefPreindexOffset(Reg::from_u8(Rn), (word & 0xfff) as u16, U, false),
+                            Operand::Nothing,
+                            Operand::Nothing,
+                            Operand::Nothing,
+                        ];
+                        return Ok(());
+                    }
+                    if word & 0b10000 != 0 {
+                        return Err(DecodeError::InvalidOpcode);
+                    }
+                    let shift = RegShift::from_raw((word & 0xfff) as u16);
+                    inst.operands = [
+                        Operand::RegDerefPreindexRegShift(Reg::from_u8(Rn), shift, U, false),
+                        Operand::Nothing,
+                        Operand::Nothing,
+                        Operand::Nothing,
+                    ];
+                    return Ok(());
+                }
                 if (word >> 24) & 0b1111 == 0b0100 {
                     // NEON structure load/store (1111 0100 ...).
                     let (opcode, operands) = decode_neon_loadstore(word)?;
