@@ -1699,6 +1699,7 @@ impl Opcode {
                     NeonOp::VSRI => "vsri",
                     NeonOp::VEXT => "vext",
                     NeonOp::VCVTFtoI | NeonOp::VCVTItoF => "vcvt",
+                    NeonOp::VCVTF32F16 | NeonOp::VCVTF16F32 => "vcvt",
                     NeonOp::VCEQ => "vceq",
                     NeonOp::VCGT => "vcgt",
                     NeonOp::VCGE => "vcge",

@@ -389,6 +389,15 @@ pub enum NeonOp {
     // The `dt` carries the integer element's signedness (`.s32`/`.u32`); the other side is f32.
     VCVTFtoI, // f32 -> s32/u32
     VCVTItoF, // s32/u32 -> f32
+    /// VCVT (between half-precision and single-precision, Advanced SIMD): the VECTOR
+    /// half-float conversions, distinct from the scalar VFP `VCVTHalf` (`vcvtb`/`vcvtt`)
+    /// which converts one lane at a time. Both directions convert FOUR elements and so
+    /// change register width: `vcvt.f32.f16 Qd, Dm` widens, `vcvt.f16.f32 Dd, Qm`
+    /// narrows. Half-float is how a 3D title stores vertex and animation data compactly,
+    /// which is why these appear in real code even though the A9 has no half-precision
+    /// ARITHMETIC.
+    VCVTF32F16, // f16 x4 -> f32 x4 (widen: Qd <- Dm)
+    VCVTF16F32, // f32 x4 -> f16 x4 (narrow: Dd <- Qm)
     // Vector compares (`dst` lane = all-ones on true, zero on false), integer or f32. The integer
     // forms carry signedness in `dt` for the ordered compares. VCLE/VCLT exist only as the
     // compare-against-`#0` (two-registers-misc) forms; the register-register `a <= b`/`a < b` cases
@@ -1244,8 +1253,9 @@ fn decode_neon_dataproc(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError
 /// select the operation: `{op2,op1,op0,F}` where `op2:op1:op0` picks VMLA(000)/VMLS(010)/VMUL(100)
 /// and `F` (bit8) selects the f32 form over the integer one. The scalar's register and lane index
 /// come from `Vm`/`M` per the element size (32-bit: `Dm = Vm`, index `M`; 16-bit: `Dm = Vm[2:0]`,
-/// index `M:Vm[3]`). The widening (`vmlal`/`vmull`) and saturating-doubling (`vqdmulh`/`vqrdmulh`/
-/// `vqdmull`) by-scalar forms are not decoded yet.
+/// index `M:Vm[3]`). The widening forms (`vmlal`/`vmlsl`/`vmull` by scalar, op 0010/0110/1010) take
+/// a `Q` destination, a `D` first source and bit24 as `U` (the sign), not `Q`. The saturating-doubling
+/// (`vqdmulh`/`vqrdmulh`/`vqdmull`) by-scalar forms are not decoded yet.
 #[allow(non_snake_case)]
 fn decode_neon_2reg_scalar(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
     let Q = (word >> 24) & 1 != 0;
@@ -1262,13 +1272,18 @@ fn decode_neon_2reg_scalar(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeEr
     let nnum = (N << 4) | Vn;
 
     // The multiply/accumulate forms select the operation from bits[11:9] and float from bit8.
-    let (neon_op, float) = match op {
-        0b0000 => (NeonOp::VMLA, false),
-        0b0001 => (NeonOp::VMLA, true),
-        0b0100 => (NeonOp::VMLS, false),
-        0b0101 => (NeonOp::VMLS, true),
-        0b1000 => (NeonOp::VMUL, false),
-        0b1001 => (NeonOp::VMUL, true),
+    let (neon_op, float, long) = match op {
+        0b0000 => (NeonOp::VMLA, false, false),
+        0b0001 => (NeonOp::VMLA, true, false),
+        0b0100 => (NeonOp::VMLS, false, false),
+        0b0101 => (NeonOp::VMLS, true, false),
+        0b1000 => (NeonOp::VMUL, false, false),
+        0b1001 => (NeonOp::VMUL, true, false),
+        // the long forms: `vmlal.<s|u>N Qd, Dn, Dm[x]` and friends. A football title's texture
+        // filter kernel is `vmlal.s16 q11, d3, d2[0]` in its inner loop.
+        0b0010 => (NeonOp::VMLAL, false, true),
+        0b0110 => (NeonOp::VMLSL, false, true),
+        0b1010 => (NeonOp::VMULL, false, true),
         _ => return Err(DecodeError::Incomplete),
     };
 
@@ -1284,6 +1299,19 @@ fn decode_neon_2reg_scalar(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeEr
         _ => return Err(DecodeError::InvalidOpcode),
     };
 
+    if long {
+        // bit24 is `U` here; the suffix names the narrow source element size.
+        let dt = if Q { SIMDDataType::Unsigned(esize) } else { SIMDDataType::Signed(esize) };
+        return Ok((
+            Opcode::Neon { op: neon_op, dt },
+            [
+                simd_q(dnum),
+                simd_d(nnum),
+                Operand::SIMDRegLane(SIMDReg::new(SIMDSizeCode::D, mnum), index),
+                Operand::Nothing,
+            ],
+        ));
+    }
     let dt = if float { SIMDDataType::Float(esize) } else { SIMDDataType::Int(esize) };
     Ok((
         Opcode::Neon { op: neon_op, dt },
@@ -1610,6 +1638,34 @@ fn decode_neon_2misc(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
         ));
     }
 
+    // VCVT between half- and single-precision (bits[17:16] == 10, bits[11:7] == 0110:op,
+    // bit6 == 0, size == 01). Like VMOVN above, the two operands are DIFFERENT widths, so
+    // this returns directly rather than through the shared `simd_qd` tail:
+    //   op 0 -> `vcvt.f16.f32 Dd, Qm`  narrow four singles into four halves
+    //   op 1 -> `vcvt.f32.f16 Qd, Dm`  widen four halves into four singles
+    //
+    // The direction of `op` is the way round the ASSEMBLER puts it, checked rather than
+    // read off a table: `vcvt.f32.f16 q2, d1` assembles to op == 1. Getting this pair
+    // backwards is invisible in a disassembler (both render as `vcvt`) and silently
+    // swaps a widen for a narrow in a lifter, so it is pinned by conformance cases in
+    // `vitaslop-conformance-suite-arm` whose goldens come from qemu.
+    // `size` names the HALF end of the conversion in both directions, so only 01 is
+    // defined; the data type carried here names the DESTINATION element, matching what
+    // the other `vcvt` forms in this space do.
+    if B == 0b10 && (sub == 0b0_1100 || sub == 0b0_1110) && !Q && esize == 16 {
+        return Ok(if sub == 0b0_1110 {
+            (
+                Opcode::Neon { op: NeonOp::VCVTF32F16, dt: SIMDDataType::Float(32) },
+                [simd_q(dnum), simd_d(mnum), Operand::Nothing, Operand::Nothing],
+            )
+        } else {
+            (
+                Opcode::Neon { op: NeonOp::VCVTF16F32, dt: SIMDDataType::Float(16) },
+                [simd_d(dnum), simd_q(mnum), Operand::Nothing, Operand::Nothing],
+            )
+        });
+    }
+
     let (op, dt) = match (B, sub) {
         // VREVn: reverse element order within each 16/32/64-bit container (bits[17:16] == 00,
         // bits[11:7] == 000:op with op = bits[8:7]). The `.NN` suffix names the element size, which
@@ -1808,6 +1864,14 @@ fn decode_neon_2shift(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> 
     if matches!(B, 0b1000 | 0b1001) {
         return decode_neon_shift_narrow(word);
     }
+    // VCVT between floating-point and FIXED-POINT, opc = bits[11:8] = `111 op`: the shift
+    // amount is the number of FRACTIONAL BITS, `64 - imm6`, not a shift of the value. A
+    // title storing normalised quantities in 16.16 reaches for it constantly - a football
+    // title's per-frame maths runs one in its first minute - and it shares this class with
+    // the plain immediate shifts only because the immediate sits in the same field.
+    if matches!(B, 0b1110 | 0b1111) {
+        return decode_neon_vcvt_fixed(word);
+    }
     // `vmovl`/`vshll` occupy bits[11:8] == 1010 with bits[7:6] == 00.
     if B != 0b1010 || (word >> 6) & 0b11 != 0 {
         return Err(DecodeError::Incomplete);
@@ -1836,6 +1900,41 @@ fn decode_neon_2shift(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> 
     Ok((
         Opcode::Neon { op: NeonOp::VMOVL, dt },
         [simd_q(dnum), simd_d(mnum), Operand::Nothing, Operand::Nothing],
+    ))
+}
+
+/// VCVT between floating-point and fixed-point, Advanced SIMD (the "two registers and a
+/// shift amount" class): `1111 001U 1D imm6 Vd 111 op Q M 1 Vm`.
+///
+/// `op` (bit 8) is the direction - 0 is fixed-point to floating-point, 1 is floating-point
+/// to fixed-point - and `U` (bit 24) the signedness of the fixed-point side. Only 32-bit
+/// elements are defined, which the encoding states as `imm6` bits[21:19] being `1xx`; the
+/// FRACTIONAL BIT COUNT is `64 - imm6` and rides in the last operand, exactly where the
+/// immediate shifts put their shift.
+#[allow(non_snake_case)]
+fn decode_neon_vcvt_fixed(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
+    let U = (word >> 24) & 1;
+    let to_fixed = (word >> 8) & 1 != 0;
+    let Q = (word >> 6) & 1 != 0;
+    let imm6 = (word >> 16) & 0b11_1111;
+    // imm6[5] == 0 is UNDEFINED here: the class has no 8- or 16-bit fixed-point form.
+    if imm6 & 0b10_0000 == 0 {
+        return Err(DecodeError::Incomplete);
+    }
+    let frac = 64 - imm6;
+    let dt = if U == 1 { SIMDDataType::Unsigned(32) } else { SIMDDataType::Signed(32) };
+    let op = if to_fixed { NeonOp::VCVTFtoI } else { NeonOp::VCVTItoF };
+
+    let D = ((word >> 22) & 1) as u8;
+    let M = ((word >> 5) & 1) as u8;
+    let Vd = ((word >> 12) & 0b1111) as u8;
+    let Vm = (word & 0b1111) as u8;
+    let dnum = (D << 4) | Vd;
+    let mnum = (M << 4) | Vm;
+
+    Ok((
+        Opcode::Neon { op, dt },
+        [simd_qd(Q, dnum), simd_qd(Q, mnum), Operand::Imm(frac), Operand::Nothing],
     ))
 }
 
