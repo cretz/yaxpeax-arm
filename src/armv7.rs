@@ -255,6 +255,16 @@ pub enum Opcode {
     SMMUL,
     SMULW(bool),
     SMUAD,
+    // The `x` (exchange the halves of Rm) and `r` (round) forms of the dual/most-significant
+    // multiplies: distinct opcodes, because a decode that dropped the bit computed a different
+    // result with no sign anything was lost.
+    SMUADX,
+    SMLADX,
+    SMUSDX,
+    SMLSDX,
+    SMMULR,
+    SMMLAR,
+    SMMLSR,
     SDIV,
     UDIV,
     SMLALD(bool),
@@ -485,6 +495,11 @@ pub enum NeonOp {
     VHSUB,
     // Bitwise NOT (two registers, miscellaneous).
     VMVN,
+    // Population count of each byte (two registers, miscellaneous; `.8` only).
+    VCNT,
+    // Count leading SIGN bits / leading ZEROS in each element (two registers, miscellaneous).
+    VCLS,
+    VCLZ,
     // Saturating absolute value / negate (two registers, miscellaneous): the saturating
     // siblings of VABS/VNEG, which differ only at the element's minimum, where the true
     // result is one past the maximum.
@@ -849,6 +864,249 @@ pub enum SIMDElement {
     AllLanes,
 }
 
+/// The A32 MEDIA instructions (`A5.4`, `cond 011x xxxx xxxx xxxx xxxx xxx1 xxxx`): parallel
+/// add/subtract, packing/unpacking/saturation/reversal, the dual signed multiplies, `usad8`,
+/// the bitfield group and `udf`. Every opcode and operand shape here is the one the Thumb-2
+/// decoder produces for the same instruction, so a consumer lowers both encodings with one
+/// rule.
+///
+/// Forms whose Thumb decode carries no distinguishing field (the `x` exchange of
+/// `smuad`/`smlad`/`smusd`/`smlsd`, the `r` rounding of `smmul`/`smmla`/`smmls`) and the
+/// long dual multiplies are refused as [`DecodeError::Incomplete`] rather than decoded as
+/// their plain form - a decode that drops a bit is a wrong answer, not a partial one.
+#[allow(non_snake_case)]
+fn decode_arm_media(word: u32, inst: &mut Instruction) -> Result<(), DecodeError> {
+    let op1 = ((word >> 20) & 0x1f) as u8;
+    let op2 = ((word >> 5) & 0b111) as u8;
+    let r16 = ((word >> 16) & 0xf) as u8;
+    let r12 = ((word >> 12) & 0xf) as u8;
+    let r8 = ((word >> 8) & 0xf) as u8;
+    let r0 = (word & 0xf) as u8;
+    let reg = |n: u8| Operand::Reg(Reg::from_u8(n));
+    inst.s = false;
+    match op1 >> 3 {
+        // Parallel addition and subtraction (`A5.4.1`, `A5.4.2`): U = bit22, the variant
+        // (plain / saturating / halving) = bits[21:20], the operation = op2.
+        0b00 => {
+            let variant = (op1 & 0b11) as usize;
+            if variant == 0 {
+                return Err(DecodeError::Undefined);
+            }
+            let row = match op2 {
+                0b000 => 0, // add16
+                0b001 => 1, // asx
+                0b010 => 2, // sax
+                0b011 => 3, // sub16
+                0b100 => 4, // add8
+                0b111 => 5, // sub8
+                _ => return Err(DecodeError::Undefined),
+            };
+            let signed = op1 & 0b100 == 0;
+            let table: [Opcode; 18] = if signed {
+                [
+                    Opcode::SADD16, Opcode::QADD16, Opcode::SHADD16,
+                    Opcode::SASX, Opcode::QASX, Opcode::SHASX,
+                    Opcode::SSAX, Opcode::QSAX, Opcode::SHSAX,
+                    Opcode::SSUB16, Opcode::QSUB16, Opcode::SHSUB16,
+                    Opcode::SADD8, Opcode::QADD8, Opcode::SHADD8,
+                    Opcode::SSUB8, Opcode::QSUB8, Opcode::SHSUB8,
+                ]
+            } else {
+                [
+                    Opcode::UADD16, Opcode::UQADD16, Opcode::UHADD16,
+                    Opcode::UASX, Opcode::UQASX, Opcode::UHASX,
+                    Opcode::USAX, Opcode::UQSAX, Opcode::UHSAX,
+                    Opcode::USUB16, Opcode::UQSUB16, Opcode::UHSUB16,
+                    Opcode::UADD8, Opcode::UQADD8, Opcode::UHADD8,
+                    Opcode::USUB8, Opcode::UQSUB8, Opcode::UHSUB8,
+                ]
+            };
+            if r8 != 0b1111 {
+                return Err(DecodeError::InvalidOperand);
+            }
+            inst.opcode = table[row * 3 + (variant - 1)];
+            inst.operands = [reg(r12), reg(r16), reg(r0), Operand::Nothing];
+            Ok(())
+        }
+        // Packing, unpacking, saturation and reversal (`A5.4.3`): op1 = bits[22:20].
+        0b01 => {
+            let op1 = op1 & 0b111;
+            let imm5 = ((word >> 7) & 0b11111) as u8;
+            let rotate = ((word >> 10) & 0b11) << 3;
+            let rot = if rotate != 0 { Operand::Imm32(rotate) } else { Operand::Nothing };
+            // The extend family: `op2 == 011`, `A` (Rn, bits[19:16]) == 1111 for the plain form.
+            let extend = |inst: &mut Instruction, plain: Opcode, acc: Opcode| {
+                if r16 == 0b1111 {
+                    inst.opcode = plain;
+                    inst.operands = [reg(r12), reg(r0), rot, Operand::Nothing];
+                } else {
+                    inst.opcode = acc;
+                    inst.operands = [reg(r12), reg(r16), reg(r0), rot];
+                }
+            };
+            match (op1, op2) {
+                (0b000, op2) if op2 & 1 == 0 => {
+                    // PKHBT / PKHTB: tb = bit6; the shift is LSL for BT and ASR for TB.
+                    let tb = (word >> 6) & 1 != 0;
+                    inst.opcode = if tb { Opcode::PKHTB } else { Opcode::PKHBT };
+                    let shift = thumb::DecodeImmShift(r0, if tb { 0b10 } else { 0b00 }, imm5);
+                    inst.operands = [reg(r12), reg(r16), Operand::RegShift(shift), Operand::Nothing];
+                }
+                (0b000, 0b011) => extend(inst, Opcode::SXTB16, Opcode::SXTAB16),
+                (0b000, 0b101) => {
+                    if r8 != 0b1111 {
+                        return Err(DecodeError::InvalidOperand);
+                    }
+                    inst.opcode = Opcode::SEL;
+                    inst.operands = [reg(r12), reg(r16), reg(r0), Operand::Nothing];
+                }
+                (0b010 | 0b011, op2) if op2 & 1 == 0 => {
+                    // SSAT: saturate to sat_imm + 1 bits, after an LSL/ASR by imm5 (sh = bit6).
+                    let sh = ((word >> 6) & 1) as u8;
+                    inst.opcode = Opcode::SSAT;
+                    inst.operands = [
+                        reg(r12),
+                        Operand::Imm32(((word >> 16) & 0b11111) + 1),
+                        Operand::RegShift(thumb::DecodeImmShift(r0, sh << 1, imm5)),
+                        Operand::Nothing,
+                    ];
+                }
+                (0b010, 0b001) => {
+                    if r8 != 0b1111 {
+                        return Err(DecodeError::InvalidOperand);
+                    }
+                    inst.opcode = Opcode::SSAT16;
+                    inst.operands = [reg(r12), Operand::Imm32(((word >> 16) & 0b1111) + 1), reg(r0), Operand::Nothing];
+                }
+                (0b010, 0b011) => extend(inst, Opcode::SXTB, Opcode::SXTAB),
+                (0b011, 0b011) => extend(inst, Opcode::SXTH, Opcode::SXTAH),
+                (0b100, 0b011) => extend(inst, Opcode::UXTB16, Opcode::UXTAB16),
+                (0b110, 0b011) => extend(inst, Opcode::UXTB, Opcode::UXTAB),
+                (0b111, 0b011) => extend(inst, Opcode::UXTH, Opcode::UXTAH),
+                (0b110 | 0b111, op2) if op2 & 1 == 0 => {
+                    // USAT: saturate to sat_imm bits (no +1), after an LSL/ASR by imm5.
+                    let sh = ((word >> 6) & 1) as u8;
+                    inst.opcode = Opcode::USAT;
+                    inst.operands = [
+                        reg(r12),
+                        Operand::Imm32((word >> 16) & 0b11111),
+                        Operand::RegShift(thumb::DecodeImmShift(r0, sh << 1, imm5)),
+                        Operand::Nothing,
+                    ];
+                }
+                (0b110, 0b001) => {
+                    if r8 != 0b1111 {
+                        return Err(DecodeError::InvalidOperand);
+                    }
+                    inst.opcode = Opcode::USAT16;
+                    inst.operands = [reg(r12), Operand::Imm32((word >> 16) & 0b1111), reg(r0), Operand::Nothing];
+                }
+                (0b011 | 0b111, 0b001 | 0b101) => {
+                    // REV / REV16 / RBIT / REVSH: bits[19:16] and bits[11:8] are fixed 1111.
+                    if r16 != 0b1111 || r8 != 0b1111 {
+                        return Err(DecodeError::InvalidOperand);
+                    }
+                    inst.opcode = match (op1, op2) {
+                        (0b011, 0b001) => Opcode::REV,
+                        (0b011, _) => Opcode::REV16,
+                        (_, 0b001) => Opcode::RBIT,
+                        _ => Opcode::REVSH,
+                    };
+                    inst.operands = [reg(r12), reg(r0), Operand::Nothing, Operand::Nothing];
+                }
+                _ => return Err(DecodeError::Undefined),
+            }
+            Ok(())
+        }
+        // Signed multiplies (`A5.4.4`): Rd = bits[19:16], Ra = bits[15:12], Rm = bits[11:8],
+        // Rn = bits[3:0]; bit5 is the exchange / round bit.
+        0b10 => {
+            let op1 = op1 & 0b111;
+            // bit5 is `M` (exchange) for the dual multiplies and `R` (round) for the
+            // most-significant-word ones; each has its own opcode.
+            let xr = (word >> 5) & 1 != 0;
+            let acc = r12 != 0b1111;
+            let op = match (op1, op2 & 0b110, acc, xr) {
+                (0b000, 0b000, false, false) => Opcode::SMUAD,
+                (0b000, 0b000, false, true) => Opcode::SMUADX,
+                (0b000, 0b000, true, false) => Opcode::SMLAD,
+                (0b000, 0b000, true, true) => Opcode::SMLADX,
+                (0b000, 0b010, false, false) => Opcode::SMUSD,
+                (0b000, 0b010, false, true) => Opcode::SMUSDX,
+                (0b000, 0b010, true, false) => Opcode::SMLSD,
+                (0b000, 0b010, true, true) => Opcode::SMLSDX,
+                (0b101, 0b000, false, false) => Opcode::SMMUL,
+                (0b101, 0b000, false, true) => Opcode::SMMULR,
+                (0b101, 0b000, true, false) => Opcode::SMMLA,
+                (0b101, 0b000, true, true) => Opcode::SMMLAR,
+                (0b101, 0b110, true, false) => Opcode::SMMLS,
+                (0b101, 0b110, true, true) => Opcode::SMMLSR,
+                // smlald / smlsld, and the ARMv7-A divide encodings the A9 does not have.
+                (0b100, _, _, _) => return Err(DecodeError::Incomplete),
+                _ => return Err(DecodeError::Undefined),
+            };
+            inst.opcode = op;
+            inst.operands = if acc {
+                [reg(r16), reg(r0), reg(r8), reg(r12)]
+            } else {
+                [reg(r16), reg(r0), reg(r8), Operand::Nothing]
+            };
+            Ok(())
+        }
+        // `usad8`/`usada8`, the bitfield group, and `udf` (`A5.4`).
+        _ => {
+            let lsb = ((word >> 7) & 0b11111) as u16;
+            let hi5 = ((word >> 16) & 0b11111) as u16; // msb for BFI/BFC, widthm1 for the extracts
+            match (op1, op2) {
+                (0b11000, 0b000) => {
+                    // USAD8 (Ra == 1111) / USADA8.
+                    if r12 == 0b1111 {
+                        inst.opcode = Opcode::USAD8;
+                        inst.operands = [reg(r16), reg(r0), reg(r8), Operand::Nothing];
+                    } else {
+                        inst.opcode = Opcode::USADA8;
+                        inst.operands = [reg(r16), reg(r0), reg(r8), reg(r12)];
+                    }
+                }
+                (0b11010 | 0b11011, 0b010 | 0b110) | (0b11110 | 0b11111, 0b010 | 0b110) => {
+                    // SBFX / UBFX: Rd = bits[15:12], Rn = bits[3:0], lsb, width = widthm1 + 1.
+                    if lsb + hi5 > 31 {
+                        return Err(DecodeError::Unpredictable);
+                    }
+                    inst.opcode = if op1 & 0b00100 != 0 { Opcode::UBFX } else { Opcode::SBFX };
+                    inst.operands = [reg(r12), reg(r0), Operand::Imm12(lsb), Operand::Imm12(hi5 + 1)];
+                }
+                (0b11100 | 0b11101, 0b000 | 0b100) => {
+                    // BFC (Rn == 1111) / BFI: the operand is the field width, msb - lsb + 1.
+                    if hi5 < lsb {
+                        return Err(DecodeError::Unpredictable);
+                    }
+                    let width = (hi5 + 1) - lsb;
+                    if r0 == 0b1111 {
+                        inst.opcode = Opcode::BFC;
+                        inst.operands = [reg(r12), Operand::Imm12(lsb), Operand::Imm12(width), Operand::Nothing];
+                    } else {
+                        inst.opcode = Opcode::BFI;
+                        inst.operands = [reg(r12), reg(r0), Operand::Imm12(lsb), Operand::Imm12(width)];
+                    }
+                }
+                (0b11111, 0b111) => {
+                    // UDF #imm16 (`imm12:imm4`), unconditional in intent (cond == 1110).
+                    inst.opcode = Opcode::UDF;
+                    inst.operands = [
+                        Operand::Imm32(((word >> 4) & 0xfff0) | (word & 0xf)),
+                        Operand::Nothing,
+                        Operand::Nothing,
+                        Operand::Nothing,
+                    ];
+                }
+                _ => return Err(DecodeError::Undefined),
+            }
+            Ok(())
+        }
+    }
+}
+
 /// decode the NEON structure load/store space (`1111 0100 ...`). currently handles the `vld1`/
 /// `vst1` (single structure to all/one, and multiple) contiguous "multiple" forms; the strided
 /// `vld2`/`vld3`/`vld4` and single-lane/all-lanes forms are deferred (`InvalidOpcode`).
@@ -1098,7 +1356,7 @@ fn adv_simd_expand_imm(op: u8, cmode: u8, imm8: u8) -> u64 {
                 }
             } else {
                 // f32: aBbbbbbc defgh000 expanded then replicated across two 32-bit lanes.
-                let bit = |n: u32| ((b >> n) & 1) as u64;
+                let bit = |n: u32| (b >> n) & 1;
                 let val = (bit(7) << 31)
                     | ((1 - bit(6)) << 30)
                     | (if bit(6) == 1 { 0x1fu64 << 25 } else { 0 })
@@ -1706,9 +1964,17 @@ fn decode_neon_2misc(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
         (0b11, 0b0_1010) if float_ok => (NeonOp::VRECPE, SIMDDataType::Float(esize)),
         (0b11, 0b0_1001) if float_ok => (NeonOp::VRSQRTE, SIMDDataType::Unsigned(esize)),
         (0b11, 0b0_1011) if float_ok => (NeonOp::VRSQRTE, SIMDDataType::Float(esize)),
+        // VCNT (bits[17:16] == 00, bits[11:7] == 01010): population count of each byte; only
+        // size 00 (`.8`) is defined.
+        (0b00, 0b0_1010) if esize == 8 => (NeonOp::VCNT, SIMDDataType::Any(8)),
+        // VCLS (bits[11:7] == 01000, `.s8/.s16/.s32`) and VCLZ (01001, `.i8/.i16/.i32`).
+        (0b00, 0b0_1000) if esize != 64 => (NeonOp::VCLS, SIMDDataType::Signed(esize)),
+        (0b00, 0b0_1001) if esize != 64 => (NeonOp::VCLZ, SIMDDataType::Any(esize)),
         // Two-register permutes (bits[17:16] == 10): VTRN (bits[11:7] == 00001), VUZP (00010),
-        // VZIP (00011). Element size 8/16/32 from bits[19:18]; size 64 is undefined. (VSWP,
-        // bits[11:7] == 00000, renders without a data-type suffix and is not decoded yet.)
+        // VZIP (00011). Element size 8/16/32 from bits[19:18]; size 64 is undefined. VSWP
+        // (00000) exchanges the two registers whole; only size 00 is defined, and it renders
+        // without a data-type suffix.
+        (0b10, 0b0_0000) if esize == 8 => (NeonOp::VSWP, SIMDDataType::Any(8)),
         (0b10, 0b0_0001) if esize != 64 => (NeonOp::VTRN, SIMDDataType::Any(esize)),
         (0b10, 0b0_0010) if esize != 64 => (NeonOp::VUZP, SIMDDataType::Any(esize)),
         (0b10, 0b0_0011) if esize != 64 => (NeonOp::VZIP, SIMDDataType::Any(esize)),
@@ -1828,11 +2094,11 @@ fn decode_neon_vext(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> {
     // evenly divides the byte offset, with the immediate expressed in those elements (`vext.64 #1`
     // for an 8-byte shift). Match that; the transpiler multiplies the immediate back out by the
     // element byte-width to recover the byte offset.
-    let (esize, elem_imm): (u8, u32) = if imm4 % 8 == 0 {
+    let (esize, elem_imm): (u8, u32) = if imm4.is_multiple_of(8) {
         (64, (imm4 / 8) as u32)
-    } else if imm4 % 4 == 0 {
+    } else if imm4.is_multiple_of(4) {
         (32, (imm4 / 4) as u32)
-    } else if imm4 % 2 == 0 {
+    } else if imm4.is_multiple_of(2) {
         (16, (imm4 / 2) as u32)
     } else {
         (8, imm4 as u32)
@@ -1855,7 +2121,7 @@ fn decode_neon_2shift(word: u32) -> Result<(Opcode, [Operand; 4]), DecodeError> 
     // The immediate shift-by-N forms (opc = bits[11:8] in {0000,0001,0100,0101}) share this class
     // with `vmovl`. Element size and shift come from `L:immh` and `imm6`.
     // The same-width immediate shifts, including the ROUNDING forms (opc 0010/0011).
-    if matches!(B, 0b0000 | 0b0001 | 0b0010 | 0b0011 | 0b0100 | 0b0101) {
+    if matches!(B, 0b0000..=0b0101) {
         return decode_neon_shift_imm(word);
     }
     // The NARROWING right shifts: opc = bits[11:8] in {1000, 1001}. They are a separate
@@ -5023,7 +5289,7 @@ impl Decoder<ARMv7> for InstDecoder {
                 // |c o n d|0 1 1|x x x x|x|x x x x|x x x x|x x x x x|x x|1|x x x x|
                     // using language from A5-206: A == 1 and B == 1
                     // so this is media instructions (A5-207)
-                    return Err(DecodeError::Incomplete);
+                    return decode_arm_media(word, inst);
                 } else {
                 // |c o n d|0 1 1|x x x x|x|x x x x|x x x x|x x x x x|x x|0|x x x x|
                     // instructions here are A == 1, B == 0 in A5-206

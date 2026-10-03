@@ -58,7 +58,7 @@ fn ThumbExpandImm_C(imm: u16) -> Result<u32, DecodeError> {
 }
 
 #[allow(non_snake_case)]
-fn DecodeImmShift(reg: u8, ty: u8, imm5: u8) -> RegShift {
+pub(super) fn DecodeImmShift(reg: u8, ty: u8, imm5: u8) -> RegShift {
     let imm = match ty {
         0b00 => { imm5 },
         0b01 => {
@@ -3323,20 +3323,24 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                                     if op2 >= 0b10 {
                                         return Err(DecodeError::InvalidOpcode);
                                     }
-                                    if op1 == 0b111 && op2 == 0b00 {
+                                    // `usad8` exists only with op2 == 00 (`A6-3.16`).
+                                    if op1 == 0b111 && op2 != 0b00 {
                                         return Err(DecodeError::InvalidOpcode);
                                     }
                                     if op1 == 0b110 {
                                         decoder.unpredictable()?;
                                     }
+                                    // op2 bit 0 is `M` (exchange) / `R` (round): its own opcode,
+                                    // since dropping it computes a different result silently.
+                                    let xr = op2 == 0b01;
                                     inst.opcode = [
                                         Opcode::MUL, // already handled
                                         Opcode::UDF, // already handled
-                                        Opcode::SMUAD,
+                                        if xr { Opcode::SMUADX } else { Opcode::SMUAD },
                                         Opcode::UDF, // already handled
-                                        Opcode::SMUSD,
-                                        Opcode::SMMUL,
-                                        Opcode::SMMLS,
+                                        if xr { Opcode::SMUSDX } else { Opcode::SMUSD },
+                                        if xr { Opcode::SMMULR } else { Opcode::SMMUL },
+                                        if xr { Opcode::SMMLSR } else { Opcode::SMMLS },
                                         Opcode::USAD8,
                                     ][op1];
                                     inst.operands = [
@@ -3386,20 +3390,18 @@ pub fn decode_into<T: Reader<<ARMv7 as Arch>::Address, <ARMv7 as Arch>::Word>>(d
                                     if op2 >= 0b10 {
                                         return Err(DecodeError::InvalidOpcode);
                                     }
-                                    if op1 == 0b111 && op2 == 0b00 {
+                                    if op1 == 0b111 && op2 != 0b00 {
                                         return Err(DecodeError::InvalidOpcode);
                                     }
-                                    if op1 == 0b110 {
-                                        decoder.unpredictable()?;
-                                    }
+                                    let xr = op2 == 0b01;
                                     inst.opcode = [
                                         Opcode::MUL, // already handled
                                         Opcode::UDF, // already handled
-                                        Opcode::SMLAD,
+                                        if xr { Opcode::SMLADX } else { Opcode::SMLAD },
                                         Opcode::UDF, // already handled
-                                        Opcode::SMLSD,
-                                        Opcode::SMMLA,
-                                        Opcode::SMMLS,
+                                        if xr { Opcode::SMLSDX } else { Opcode::SMLSD },
+                                        if xr { Opcode::SMMLAR } else { Opcode::SMMLA },
+                                        if xr { Opcode::SMMLSR } else { Opcode::SMMLS },
                                         Opcode::USADA8,
                                     ][op1];
                                     inst.operands = [

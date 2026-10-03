@@ -1195,6 +1195,13 @@ impl <T: fmt::Write, Y: YaxColors> Colorize<T, Y> for ConditionedOpcode {
             Opcode::SMMUL |
             Opcode::SMULW(_) |
             Opcode::SMUAD |
+            Opcode::SMUADX |
+            Opcode::SMLADX |
+            Opcode::SMUSDX |
+            Opcode::SMLSDX |
+            Opcode::SMMULR |
+            Opcode::SMMLAR |
+            Opcode::SMMLSR |
             Opcode::SMULL |
             Opcode::SMUL(_, _) |
             Opcode::SMAL(_, _) |
@@ -1518,6 +1525,13 @@ impl Opcode {
             Opcode::SMUSD => { "smusd" },
             Opcode::SMMUL => { "smmul" },
             Opcode::SMUAD => { "smuad" },
+            Opcode::SMUADX => { "smuadx" },
+            Opcode::SMLADX => { "smladx" },
+            Opcode::SMUSDX => { "smusdx" },
+            Opcode::SMLSDX => { "smlsdx" },
+            Opcode::SMMULR => { "smmulr" },
+            Opcode::SMMLAR => { "smmlar" },
+            Opcode::SMMLSR => { "smmlsr" },
             Opcode::TBB => { "tbb" },
             Opcode::TBH => { "tbh" },
             Opcode::UDF => { "udf" },
@@ -1742,6 +1756,9 @@ impl Opcode {
                     NeonOp::VHADD => "vhadd",
                     NeonOp::VHSUB => "vhsub",
                     NeonOp::VMVN => "vmvn",
+                    NeonOp::VCNT => "vcnt",
+                    NeonOp::VCLS => "vcls",
+                    NeonOp::VCLZ => "vclz",
                     NeonOp::VQABS => "vqabs",
                     NeonOp::VQNEG => "vqneg",
                 }
