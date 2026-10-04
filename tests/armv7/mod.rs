@@ -106,6 +106,22 @@ fn test_display(data: [u8; 4], expected: &'static str) {
 }
 
 #[test]
+fn test_a32_hints() {
+    // The hint space under MSR (immediate) with op1 == 0 (table A5-11): every encoding decodes,
+    // and the unallocated hints execute as NOP.
+    test_display([0x00, 0xf0, 0x20, 0xe3], "nop");
+    test_display([0x01, 0xf0, 0x20, 0xe3], "yield");
+    test_display([0x02, 0xf0, 0x20, 0xe3], "wfe");
+    test_display([0x03, 0xf0, 0x20, 0xe3], "wfi");
+    test_display([0x04, 0xf0, 0x20, 0xe3], "sev");
+    test_display([0x14, 0xf0, 0x20, 0xe3], "csdb");
+    test_display([0xf5, 0xf0, 0x20, 0xe3], "dbg 0x5");
+    test_display([0x80, 0xf0, 0x20, 0xe3], "nop");
+    // MSR (immediate) with a mask still decodes as MSR.
+    test_display([0x1f, 0xf0, 0x28, 0xe3], "msr apsr_nzcvq, 0x1f");
+}
+
+#[test]
 fn test_unpredictable_instructions() {
     // banked MRS (read of R8_fiq); decoded like capstone rather than rejected.
     test_display([0x00, 0x02, 0x08, 0x01], "mrseq r0, r8_fiq");

@@ -5073,7 +5073,23 @@ impl Decoder<ARMv7> for InstDecoder {
                             let op1 = (word >> 16) & 0b1111;
                             match op1 {
                                 0b0000 => {
-
+                                    // Hints (table A5-11): `NOP`, `YIELD`, `WFE`, `WFI`, `SEV`,
+                                    // `CSDB`, `DBG #option`. Every other op2 is an unallocated
+                                    // hint, which executes as a NOP.
+                                    let op2 = word & 0xff;
+                                    inst.operands = [Operand::Nothing, Operand::Nothing, Operand::Nothing, Operand::Nothing];
+                                    inst.opcode = match op2 {
+                                        0b0000_0001 => Opcode::YIELD,
+                                        0b0000_0010 => Opcode::WFE,
+                                        0b0000_0011 => Opcode::WFI,
+                                        0b0000_0100 => Opcode::SEV,
+                                        0b0001_0100 => Opcode::CSDB,
+                                        0b1111_0000..=0b1111_1111 => {
+                                            inst.operands[0] = Operand::Imm12((op2 & 0xf) as u16);
+                                            Opcode::DBG
+                                        }
+                                        _ => Opcode::NOP,
+                                    };
                                 },
                                 _ => {
                                     // Move to Special register, Application level MSR (immediate) on
