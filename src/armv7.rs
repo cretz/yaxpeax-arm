@@ -4352,10 +4352,8 @@ impl Decoder<ARMv7> for InstDecoder {
                                         } else {
                                             inst.opcode = Opcode::LDRD;
                                         }
-                                        if self.should_is_must {
-                                            if (word >> 8) & 0b1111 == 0 {
-                                                return Err(DecodeError::Nonconforming);
-                                            }
+                                        if self.should_is_must && (word >> 8) & 0b1111 != 0 {
+                                            return Err(DecodeError::Nonconforming);
                                         }
                                         let Rm = word as u8 & 0b1111;
                                         let Rt = (word >> 12) as u8 & 0b1111;
@@ -4385,10 +4383,8 @@ impl Decoder<ARMv7> for InstDecoder {
                                         } else {
                                             inst.opcode = Opcode::LDRSB;
                                         }
-                                        if self.should_is_must {
-                                            if (word >> 8) & 0b1111 == 0 {
-                                                return Err(DecodeError::Nonconforming);
-                                            }
+                                        if self.should_is_must && (word >> 8) & 0b1111 != 0 {
+                                            return Err(DecodeError::Nonconforming);
                                         }
                                         let Rm = word as u8 & 0b1111;
                                         let Rt = (word >> 12) as u8 & 0b1111;
@@ -4440,11 +4436,6 @@ impl Decoder<ARMv7> for InstDecoder {
                                         } else {
                                             inst.opcode = Opcode::LDRSB;
                                         }
-                                        if self.should_is_must {
-                                            if (word >> 8) & 0b1111 == 0 {
-                                                return Err(DecodeError::Nonconforming);
-                                            }
-                                        }
                                         let Rt = (word >> 12) as u8 & 0b1111;
                                         let Rn = (word >> 16) as u8 & 0b1111;
                                         let imm = (HiOffset << 4) as u16 | LoOffset as u16;
@@ -4478,10 +4469,8 @@ impl Decoder<ARMv7> for InstDecoder {
                                         } else {
                                             inst.opcode = Opcode::STRD;
                                         }
-                                        if self.should_is_must {
-                                            if (word >> 8) & 0b1111 == 0 {
-                                                return Err(DecodeError::Nonconforming);
-                                            }
+                                        if self.should_is_must && (word >> 8) & 0b1111 != 0 {
+                                            return Err(DecodeError::Nonconforming);
                                         }
                                         let Rm = word as u8 & 0b1111;
                                         let Rt = (word >> 12) as u8 & 0b1111;
@@ -4508,10 +4497,8 @@ impl Decoder<ARMv7> for InstDecoder {
                                         } else {
                                             inst.opcode = Opcode::LDRSH;
                                         }
-                                        if self.should_is_must {
-                                            if (word >> 8) & 0b1111 == 0 {
-                                                return Err(DecodeError::Nonconforming);
-                                            }
+                                        if self.should_is_must && (word >> 8) & 0b1111 != 0 {
+                                            return Err(DecodeError::Nonconforming);
                                         }
                                         let Rm = word as u8 & 0b1111;
                                         let Rt = (word >> 12) as u8 & 0b1111;
@@ -4562,11 +4549,6 @@ impl Decoder<ARMv7> for InstDecoder {
                                             inst.opcode = Opcode::LDRSHT;
                                         } else {
                                             inst.opcode = Opcode::LDRSH;
-                                        }
-                                        if self.should_is_must {
-                                            if (word >> 8) & 0b1111 == 0 {
-                                                return Err(DecodeError::Nonconforming);
-                                            }
                                         }
                                         let Rt = (word >> 12) as u8 & 0b1111;
                                         let Rn = (word >> 16) as u8 & 0b1111;
@@ -4776,10 +4758,8 @@ impl Decoder<ARMv7> for InstDecoder {
                                         }
                                     }
 
-                                    if self.should_is_must {
-                                        if (word >> 8) & 0b1111 != 0 {
-                                            return Err(DecodeError::Nonconforming);
-                                        }
+                                    if self.should_is_must && (word >> 8) & 0b1111 != 0 {
+                                        return Err(DecodeError::Nonconforming);
                                     }
 
                                     inst.operands = [
