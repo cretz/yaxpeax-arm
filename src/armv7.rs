@@ -3921,6 +3921,30 @@ impl Decoder<ARMv7> for InstDecoder {
             } else {
                 // op1=0xxxxxxx, "Memory hints, Advanced SIMD instructions, and miscellaneous
                 // instructions on pge A5-215"
+                // Barriers and CLREX (table A5-24, op1 = 0b1010111):
+                // `1111 0101 0111 1111 1111 0000 op2 option`. Same operands as the Thumb forms.
+                if word & 0xffff_ff00 == 0xf57f_f000 {
+                    let option = (word & 0b1111) as u16;
+                    inst.opcode = match (word >> 4) & 0b1111 {
+                        0b0001 => {
+                            if self.should_is_must && option != 0b1111 {
+                                return Err(DecodeError::Nonconforming);
+                            }
+                            Opcode::CLREX
+                        }
+                        0b0100 => Opcode::DSB,
+                        0b0101 => Opcode::DMB,
+                        0b0110 => Opcode::ISB,
+                        _ => return Err(DecodeError::Undefined),
+                    };
+                    inst.operands = [
+                        if inst.opcode == Opcode::CLREX { Operand::Nothing } else { Operand::Imm12(option) },
+                        Operand::Nothing,
+                        Operand::Nothing,
+                        Operand::Nothing,
+                    ];
+                    return Ok(());
+                }
                 // Memory hints (table A5-25): `pld{w}`/`pli` with an immediate
                 // (1111 01x1 U {R}01 Rn 1111 imm12) or a register offset
                 // (1111 011x U {R}01 Rn 1111 imm5 type 0 Rm). Preloads have no

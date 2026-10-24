@@ -122,6 +122,16 @@ fn test_a32_hints() {
 }
 
 #[test]
+fn test_a32_barriers() {
+    // The unconditional miscellaneous group (table A5-24, op1 == 0b1010111).
+    test_display([0x1f, 0xf0, 0x7f, 0xf5], "clrex");
+    test_display([0x4f, 0xf0, 0x7f, 0xf5], "dsb 0xf");
+    test_display([0x5f, 0xf0, 0x7f, 0xf5], "dmb 0xf");
+    test_display([0x5b, 0xf0, 0x7f, 0xf5], "dmb 0xb");
+    test_display([0x6f, 0xf0, 0x7f, 0xf5], "isb 0xf");
+}
+
+#[test]
 fn test_unpredictable_instructions() {
     // banked MRS (read of R8_fiq); decoded like capstone rather than rejected.
     test_display([0x00, 0x02, 0x08, 0x01], "mrseq r0, r8_fiq");
